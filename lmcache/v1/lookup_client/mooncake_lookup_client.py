@@ -80,6 +80,10 @@ class MooncakeLookupClient(LookupClientInterface):
         missing_indices = [i for i, r in enumerate(base_rets) if r != 1]
         layerwise_ok: dict[int, bool] = {}
         if missing_indices:
+            logger.debug(
+                "Mooncake lookup: %d base chunks missing, checking layerwise keys",
+                len(missing_indices),
+            )
             layerwise_flat: list[str] = []
             offsets: list[tuple[int, int]] = []
             for i in missing_indices:
@@ -107,8 +111,14 @@ class MooncakeLookupClient(LookupClientInterface):
                 continue
             if layerwise_ok.get(i, False):
                 continue
+            logger.debug(
+                "Mooncake lookup: prefix hit ends at chunk %d (end=%d)",
+                i - 1,
+                ends[i - 1] if i > 0 else 0,
+            )
             return ends[i - 1] if i > 0 else 0
 
+        logger.debug("Mooncake lookup: full prefix hit, end=%d", ends[-1])
         return ends[-1]
 
     def supports_producer_reuse(self) -> bool:

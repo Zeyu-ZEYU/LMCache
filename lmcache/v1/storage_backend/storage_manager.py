@@ -357,6 +357,11 @@ class StorageManager:
             if backend_name is None:
                 return {}
             groups.setdefault(backend_name, []).append(idx)
+        logger.debug(
+            "RNIC routing grouped %d keys into: %s",
+            len(keys),
+            {k: len(v) for k, v in groups.items()},
+        )
         return groups
 
     def _get_allocator_backend(
@@ -426,6 +431,11 @@ class StorageManager:
         routing = self._group_keys_by_rnic_backend(keys)
         if not routing:
             return
+        logger.debug(
+            "RNIC routing batched_put: total_keys=%d, backends=%s",
+            len(keys),
+            list(routing.keys()),
+        )
 
         # Import locally to avoid a heavy import at module load.
         from lmcache.v1.storage_backend.remote_backend import RemoteBackend
@@ -493,6 +503,11 @@ class StorageManager:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
                 continue
+            logger.debug(
+                "RNIC routing batched_get: backend=%s keys=%d",
+                backend_name,
+                len(idxs),
+            )
             keys_subset = [keys[i] for i in idxs]
             objs_subset = backend.batched_get_blocking(keys_subset)
             for idx, obj in zip(idxs, objs_subset, strict=False):
@@ -526,6 +541,11 @@ class StorageManager:
                 total_hit_chunks += 1
                 continue
             break
+        logger.debug(
+            "RNIC routing batched_contains: hit_chunks=%d, locations=%s",
+            total_hit_chunks,
+            list(block_mapping.keys()),
+        )
         return total_hit_chunks, block_mapping
 
     def put(

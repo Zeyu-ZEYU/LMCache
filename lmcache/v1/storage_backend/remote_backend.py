@@ -42,6 +42,7 @@ class RemoteBackend(StorageBackendInterface):
         self.remote_url = remote_url or config.remote_url
         assert self.remote_url is not None
         self.blocking_timeout_secs = config.blocking_timeout_secs
+        logger.info("Initializing %s with url=%s", self._name, self.remote_url)
 
         self.local_cpu_backend = local_cpu_backend
 

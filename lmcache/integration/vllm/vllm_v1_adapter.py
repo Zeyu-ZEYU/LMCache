@@ -495,6 +495,11 @@ class LMCacheConnectorV1Impl:
                             config_key,
                             value,
                         )
+        if kv_connector_extra_config and "lmcache.use_layerwise" in kv_connector_extra_config:
+            logger.info(
+                "use_layerwise explicitly set by vLLM extra config: %s",
+                config.use_layerwise,
+            )
         # Default behavior: enable layerwise only for kv_producer (prefill),
         # and disable it for kv_consumer (decode). Keep other roles untouched.
         if (
@@ -831,6 +836,12 @@ class LMCacheConnectorV1Impl:
                         sync=sync,
                         request_configs=request.request_configs,
                     )
+                    logger.debug(
+                        "Layerwise retrieve started for req_id=%s, cached_tokens=%d, sync=%s",
+                        request.req_id,
+                        lmcache_cached_tokens,
+                        sync,
+                    )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
@@ -859,6 +870,10 @@ class LMCacheConnectorV1Impl:
                         & ~ret_token_mask.to(torch.bool)
                     )
                     if missing_mask.any():
+                        logger.warning(
+                            "Non-layerwise retrieve short for req_id=%s; attempting layerwise fallback",
+                            request.req_id,
+                        )
                         old_gpu_connector = self.lmcache_engine.gpu_connector
                         try:
                             from lmcache.v1.gpu_connector import (
@@ -908,6 +923,11 @@ class LMCacheConnectorV1Impl:
                             if layerwise_ret_mask is not None:
                                 ret_token_mask = (
                                     ret_token_mask | layerwise_ret_mask
+                                )
+                                logger.info(
+                                    "Layerwise fallback retrieved %d tokens for req_id=%s",
+                                    layerwise_ret_mask.sum().item(),
+                                    request.req_id,
                                 )
                         except Exception:
                             logger.exception(
@@ -1140,6 +1160,13 @@ class LMCacheConnectorV1Impl:
                     transfer_spec=request.disagg_spec,
                     is_last_prefill=request.is_last_prefill,
                 )
+                logger.debug(
+                    "Layerwise store init for req_id=%s, tokens=%d, skip_leading=%d, has_transfer_spec=%s",
+                    request.req_id,
+                    len(token_ids),
+                    skip_leading_tokens,
+                    request.disagg_spec is not None,
+                )
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
                     is_first = False
@@ -1167,6 +1194,10 @@ class LMCacheConnectorV1Impl:
             # unpin the kv caches according to req_id
             for request in connector_metadata.requests:
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            logger.info(
+                "Layerwise save completed for %d requests",
+                len(connector_metadata.requests),
+            )
             return
 
         assert len(self.kv_caches) > 0

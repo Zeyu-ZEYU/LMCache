@@ -195,6 +195,7 @@ def CreateStorageBackends(
         )
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
+        logger.info("Created RemoteBackend (tail) with url=%s", config.remote_url)
     if config.remote_url_head is not None:
         if config.remote_url is None:
             logger.warning(
@@ -212,6 +213,9 @@ def CreateStorageBackends(
         )
         backend_name = str(remote_backend_head)
         storage_backends[backend_name] = remote_backend_head
+        logger.info(
+            "Created RemoteBackendHead (head) with url=%s", config.remote_url_head
+        )
 
     if not config.enable_pd or config.local_cpu:
         # Load storage backends from configuration

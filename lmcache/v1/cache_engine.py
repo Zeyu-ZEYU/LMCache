@@ -577,6 +577,12 @@ class LMCacheEngine:
         kv_dtype = self.metadata.kv_dtype
         transfer_spec = kwargs.pop("transfer_spec", None)
         is_last_prefill = bool(kwargs.pop("is_last_prefill", False))
+        if transfer_spec is not None:
+            logger.debug(
+                "store_layer using transfer_spec for req_id=%s, is_last_prefill=%s",
+                getattr(transfer_spec, "req_id", None),
+                is_last_prefill,
+            )
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -675,6 +681,11 @@ class LMCacheEngine:
                     transfer_spec.is_last_prefill = (
                         is_last_prefill and layer_id == self.num_layers - 1
                     )
+                    if transfer_spec.is_last_prefill:
+                        logger.info(
+                            "store_layer last layer reached for req_id=%s",
+                            getattr(transfer_spec, "req_id", None),
+                        )
                 self.storage_manager.batched_put(
                     keys[layer_id],
                     memory_objs[layer_id],
@@ -699,6 +710,11 @@ class LMCacheEngine:
 
         if transfer_spec is not None and is_last_prefill:
             transfer_spec.num_transferred_tokens = len(tokens)
+            logger.info(
+                "store_layer updated num_transferred_tokens=%d for req_id=%s",
+                len(tokens),
+                getattr(transfer_spec, "req_id", None),
+            )
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         yield
 
@@ -983,6 +999,8 @@ class LMCacheEngine:
         # synchronize the last layer
         if mem_obj_consumer is not None:
             next(mem_obj_consumer)
+        else:
+            logger.debug("retrieve_layer no keys found; skip final sync")
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)

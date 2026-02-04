@@ -141,6 +141,7 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.device_name = dev_name
             if protocol:
                 self.config.protocol = protocol
+                logger.info("Mooncake protocol overridden via URL: %s", protocol)
             logger.info("Mooncake Configuration loaded. config: %s", self.config)
 
             # Check if storage_root_dir exists and set environment variable
