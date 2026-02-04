@@ -574,6 +574,8 @@ class LMCacheEngine:
         memory_objs = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
+        transfer_spec = kwargs.pop("transfer_spec", None)
+        is_last_prefill = bool(kwargs.pop("is_last_prefill", False))
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -668,7 +670,15 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+                if transfer_spec is not None:
+                    transfer_spec.is_last_prefill = (
+                        is_last_prefill and layer_id == self.num_layers - 1
+                    )
+                self.storage_manager.batched_put(
+                    keys[layer_id],
+                    memory_objs[layer_id],
+                    transfer_spec=transfer_spec,
+                )
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -686,6 +696,8 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield
 
+        if transfer_spec is not None and is_last_prefill:
+            transfer_spec.num_transferred_tokens = len(tokens)
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         yield
 

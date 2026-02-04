@@ -495,6 +495,21 @@ class LMCacheConnectorV1Impl:
                             config_key,
                             value,
                         )
+        # Default behavior: enable layerwise only for kv_producer (prefill),
+        # and disable it for kv_consumer (decode). Keep other roles untouched.
+        if (
+            kv_connector_extra_config is None
+            or "lmcache.use_layerwise" not in kv_connector_extra_config
+        ):
+            if self.kv_role in ("kv_producer", "kv_consumer"):
+                desired = self.kv_role == "kv_producer"
+                if config.use_layerwise != desired:
+                    config.use_layerwise = desired
+                    logger.info(
+                        "Auto set use_layerwise=%s for kv_role=%s",
+                        desired,
+                        self.kv_role,
+                    )
 
     def _init_connector_state(
         self,
@@ -1053,6 +1068,9 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    request_configs=request.request_configs,
+                    transfer_spec=request.disagg_spec,
+                    is_last_prefill=request.is_last_prefill,
                 )
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
