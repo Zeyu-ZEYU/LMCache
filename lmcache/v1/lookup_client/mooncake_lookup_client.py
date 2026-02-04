@@ -48,6 +48,8 @@ class MooncakeLookupClient(LookupClientInterface):
             "LMCache v1 blending is not supported in MooncakeLookupClient yet."
         )
         self.token_database = ChunkedTokenDatabase(config, metadata)
+        # Needed to check layerwise keys when producer stores per-layer KV.
+        self.num_layers = metadata.kv_shape[0]
 
     def lookup(
         self,
@@ -55,28 +57,59 @@ class MooncakeLookupClient(LookupClientInterface):
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
-        # process token_ids to cacheengine keys
-        keys = []
-        ends = []
-        for start, end, key in self.token_database.process_tokens(token_ids):
+        # Process token_ids to CacheEngineKeys.
+        processed: list[tuple[int, CacheEngineKey]] = []
+        for _, end, key in self.token_database.process_tokens(
+            tokens=token_ids,
+            request_configs=request_configs,
+        ):
             assert isinstance(key, CacheEngineKey)
-            keys.append(key.to_string())
-            ends.append(end)
+            processed.append((end, key))
 
-        # Use batch_is_exist to check all keys at once
+        if not processed:
+            return 0
+
+        ends = [end for end, _ in processed]
+        base_key_strs = [key.to_string() for _, key in processed]
+
+        # Batch check base keys.
         # rets is list of int: 1 = found, 0 = not found, -1 = error
-        rets = self.store.batch_is_exist(keys)
+        base_rets = self.store.batch_is_exist(base_key_strs)
 
-        # Find the first key that doesn't exist (ret != 1)
-        # This follows the same logic as cache engine's lookup method
-        for i, ret in enumerate(rets):
-            if ret != 1:  # Not found or error
-                # Return the end position of the previous chunk
-                # If i == 0, no chunks were found, return 0
-                return ends[i - 1] if i > 0 else 0
+        # For chunks missing the base key, also check if all layerwise keys exist.
+        missing_indices = [i for i, r in enumerate(base_rets) if r != 1]
+        layerwise_ok: dict[int, bool] = {}
+        if missing_indices:
+            layerwise_flat: list[str] = []
+            offsets: list[tuple[int, int]] = []
+            for i in missing_indices:
+                _, key = processed[i]
+                keys_multi = key.split_layers(self.num_layers)
+                offsets.append((i, len(layerwise_flat)))
+                layerwise_flat.extend([k.to_string() for k in keys_multi])
 
-        # All keys were found, return the last end position
-        return ends[-1] if ends else 0
+            layerwise_rets = (
+                self.store.batch_is_exist(layerwise_flat)
+                if layerwise_flat
+                else []
+            )
+            for i, off in offsets:
+                all_exist = True
+                for r in layerwise_rets[off : off + self.num_layers]:
+                    if r != 1:
+                        all_exist = False
+                        break
+                layerwise_ok[i] = all_exist
+
+        # Prefix match: stop at first missing chunk.
+        for i in range(len(processed)):
+            if base_rets[i] == 1:
+                continue
+            if layerwise_ok.get(i, False):
+                continue
+            return ends[i - 1] if i > 0 else 0
+
+        return ends[-1]
 
     def supports_producer_reuse(self) -> bool:
         """Return True as MooncakeLookupClient supports producer kvcache reuse"""

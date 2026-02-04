@@ -829,6 +829,7 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         sync=sync,
+                        request_configs=request.request_configs,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -850,6 +851,75 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
                 if num_retrieved_tokens < num_expected_tokens:
+                    # Decode runs with use_layerwise=False by default. If the
+                    # producer stored KV layerwise, fallback to layerwise
+                    # retrieve for missing chunks without changing configs.
+                    missing_mask = (
+                        token_mask[:lmcache_cached_tokens]
+                        & ~ret_token_mask.to(torch.bool)
+                    )
+                    if missing_mask.any():
+                        old_gpu_connector = self.lmcache_engine.gpu_connector
+                        try:
+                            from lmcache.v1.gpu_connector import (
+                                VLLMBufferLayerwiseGPUConnector,
+                                VLLMPagedMemLayerwiseGPUConnector,
+                            )
+
+                            if self.enable_blending:
+                                layerwise_connector = (
+                                    VLLMBufferLayerwiseGPUConnector.from_metadata(
+                                        self.lmcache_engine.metadata,
+                                        use_gpu=False,
+                                        device=self.device,
+                                    )
+                                )
+                            else:
+                                layerwise_connector = (
+                                    VLLMPagedMemLayerwiseGPUConnector.from_metadata(
+                                        self.lmcache_engine.metadata,
+                                        use_gpu=False,
+                                        device=self.device,
+                                    )
+                                )
+
+                            self.lmcache_engine.gpu_connector = layerwise_connector
+
+                            layerwise_ret_mask: Optional[torch.Tensor] = None
+                            layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                                tokens[:lmcache_cached_tokens],
+                                missing_mask,
+                                kvcaches=kvcaches,
+                                slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                                sync=True,
+                                request_configs=request.request_configs,
+                            )
+                            while True:
+                                try:
+                                    out = next(layerwise_retriever)
+                                    if (
+                                        isinstance(out, torch.Tensor)
+                                        and out.dim() == 1
+                                    ):
+                                        layerwise_ret_mask = out
+                                except StopIteration:
+                                    break
+
+                            if layerwise_ret_mask is not None:
+                                ret_token_mask = (
+                                    ret_token_mask | layerwise_ret_mask
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Layerwise fallback retrieve failed for request %s",
+                                request.req_id,
+                            )
+                        finally:
+                            self.lmcache_engine.gpu_connector = old_gpu_connector
+
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+
+                if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "Request %s"
                         "The number of retrieved tokens is less than the "
@@ -861,9 +931,7 @@ class LMCacheConnectorV1Impl:
                         num_retrieved_tokens,
                         num_expected_tokens,
                     )
-                    """
-                    Report failed block IDs in case of partial failure.
-                    """
+                    # Report failed block IDs in case of partial failure.
                     missing_blocks = self.record_failed_blocks(
                         request.req_id,
                         token_mask[:lmcache_cached_tokens],

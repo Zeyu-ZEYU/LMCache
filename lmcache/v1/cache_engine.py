@@ -571,6 +571,7 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        mem_obj_consumer = None
         memory_objs = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
@@ -980,7 +981,8 @@ class LMCacheEngine:
         yield None
 
         # synchronize the last layer
-        next(mem_obj_consumer)
+        if mem_obj_consumer is not None:
+            next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
