@@ -191,9 +191,27 @@ def CreateStorageBackends(
             loop,
             local_cpu_backend,
             dst_device,
+            name="RemoteBackend",
         )
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
+    if config.remote_url_head is not None:
+        if config.remote_url is None:
+            logger.warning(
+                "remote_url_head is set but remote_url is None; "
+                "head backend will be created without routing enabled."
+            )
+        remote_backend_head = RemoteBackend(
+            config,
+            metadata,
+            loop,
+            local_cpu_backend,
+            dst_device,
+            remote_url=config.remote_url_head,
+            name="RemoteBackendHead",
+        )
+        backend_name = str(remote_backend_head)
+        storage_backends[backend_name] = remote_backend_head
 
     if not config.enable_pd or config.local_cpu:
         # Load storage backends from configuration

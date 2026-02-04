@@ -101,6 +101,7 @@ class MooncakestoreConnector(RemoteConnector):
         host: str,
         port: int,
         dev_name,
+        protocol: Optional[str],
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
         lmcache_config: Optional[LMCacheEngineConfig],
@@ -138,6 +139,8 @@ class MooncakestoreConnector(RemoteConnector):
                     self.config.master_server_address = host + ":" + str(port)
             if dev_name != "":
                 self.config.device_name = dev_name
+            if protocol:
+                self.config.protocol = protocol
             logger.info("Mooncake Configuration loaded. config: %s", self.config)
 
             # Check if storage_root_dir exists and set environment variable

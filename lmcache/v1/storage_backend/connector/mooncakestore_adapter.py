@@ -30,10 +30,12 @@ class MooncakestoreConnectorAdapter(ConnectorAdapter):
 
         parse_url = parse_remote_url(context.url)
         device_name = parse_url.query_params.get("device", [""])[0]
+        protocol = parse_url.query_params.get("protocol", [""])[0]
         return MooncakestoreConnector(
             host=parse_url.host,
             port=parse_url.port,
             dev_name=device_name,
+            protocol=protocol if protocol else None,
             loop=context.loop,
             local_cpu_backend=context.local_cpu_backend,
             lmcache_config=context.config,

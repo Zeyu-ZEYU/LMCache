@@ -31,14 +31,16 @@ class RemoteBackend(StorageBackendInterface):
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: Optional[LocalCPUBackend],
         dst_device: str = "cuda",
+        remote_url: Optional[str] = None,
+        name: Optional[str] = None,
     ):
         super().__init__(dst_device=dst_device)
         self.put_tasks: Set[CacheEngineKey] = set()
         self.lock = threading.Lock()
 
-        assert config.remote_url is not None
-
-        self.remote_url = config.remote_url
+        self._name = name or self.__class__.__name__
+        self.remote_url = remote_url or config.remote_url
+        assert self.remote_url is not None
         self.blocking_timeout_secs = config.blocking_timeout_secs
 
         self.local_cpu_backend = local_cpu_backend
@@ -70,7 +72,7 @@ class RemoteBackend(StorageBackendInterface):
         )
         logger.info(f"metadata={metadata}")
         logger.info(
-            f"Connected to remote storage at {config.remote_url}, "
+            f"Connected to remote storage at {self.remote_url}, "
             f"remote_mla_worker_id_as_0 mode: {self._mla_worker_id_as0_mode}"
         )
 
@@ -99,7 +101,7 @@ class RemoteBackend(StorageBackendInterface):
             )
 
     def __str__(self):
-        return self.__class__.__name__
+        return self._name
 
     def init_connection(self):
         # Initialize connection
@@ -113,16 +115,15 @@ class RemoteBackend(StorageBackendInterface):
             )
             return
         try:
-            assert self.config.remote_url is not None
             self.connection = CreateConnector(
-                self.config.remote_url,
+                self.remote_url,
                 self.loop,
                 self.local_cpu_backend,
                 self.config,
                 self.metadata,
             )
             logger.info(
-                f"Connection initialized/re-established at {self.config.remote_url}"
+                f"Connection initialized/re-established at {self.remote_url}"
             )
         except IrrecoverableException:
             logger.error("Irrecoverable error during connection initialization")

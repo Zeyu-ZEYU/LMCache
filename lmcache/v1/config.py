@@ -80,6 +80,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": str,
     },
+    "remote_url_head": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
     # Feature toggles
     "use_layerwise": {

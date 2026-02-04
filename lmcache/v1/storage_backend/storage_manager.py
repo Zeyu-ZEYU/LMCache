@@ -251,6 +251,22 @@ class StorageManager:
             )
         )
 
+        self._rnic_backend_tail: Optional[str] = None
+        self._rnic_backend_head: Optional[str] = None
+        self._rnic_routing_enabled = False
+        if (
+            "RemoteBackend" in self.storage_backends
+            and "RemoteBackendHead" in self.storage_backends
+        ):
+            self._rnic_backend_tail = "RemoteBackend"
+            self._rnic_backend_head = "RemoteBackendHead"
+            self._rnic_routing_enabled = True
+            logger.info(
+                "RNIC routing enabled: tail=%s head=%s",
+                self._rnic_backend_tail,
+                self._rnic_backend_head,
+            )
+
         # the backend used for actual storage
         self.non_allocator_backends = self.get_non_allocator_backends()
 
@@ -318,6 +334,31 @@ class StorageManager:
                 )
             )
 
+    def _select_rnic_label_for_chunk(self, key: CacheEngineKey) -> str:
+        # TODO: replace with a smarter policy.
+        # Default: route all chunks to the tail RNIC.
+        # Change the return value to "head" for quick testing.
+        return "tail"
+
+    def _select_rnic_backend_for_chunk(self, key: CacheEngineKey) -> Optional[str]:
+        if not self._rnic_routing_enabled:
+            return None
+        label = self._select_rnic_label_for_chunk(key)
+        if label == "head" and self._rnic_backend_head is not None:
+            return self._rnic_backend_head
+        return self._rnic_backend_tail
+
+    def _group_keys_by_rnic_backend(
+        self, keys: Sequence[CacheEngineKey]
+    ) -> dict[str, list[int]]:
+        groups: dict[str, list[int]] = {}
+        for idx, key in enumerate(keys):
+            backend_name = self._select_rnic_backend_for_chunk(key)
+            if backend_name is None:
+                return {}
+            groups.setdefault(backend_name, []).append(idx)
+        return groups
+
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
@@ -370,6 +411,123 @@ class StorageManager:
             shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
         )
 
+    def _batched_put_with_rnic_routing(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec=None,
+    ) -> None:
+        # NOTE: This routing is only applied when both tail and head
+        # RemoteBackends are configured. Non-remote backends will still
+        # receive all keys, preserving existing behavior.
+        if self.allocator_backend is None:
+            raise RuntimeError("Batched put not available for scheduler role")
+
+        routing = self._group_keys_by_rnic_backend(keys)
+        if not routing:
+            return
+
+        # Import locally to avoid a heavy import at module load.
+        from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+
+        allocator_cname = get_backend_cname(self.allocator_backend)
+
+        for backend_name, backend in self.storage_backends.items():
+            # Skip bypassed backends
+            with self._bypass_lock:
+                if backend_name in self._bypassed_backends:
+                    continue
+
+            if isinstance(backend, RemoteBackend):
+                idxs = routing.get(backend_name, [])
+                if not idxs:
+                    continue
+                keys_subset = [keys[i] for i in idxs]
+                objs_subset = [memory_objs[i] for i in idxs]
+            else:
+                keys_subset = list(keys)
+                objs_subset = memory_objs
+
+            if not keys_subset:
+                continue
+
+            allocator_backend = backend.get_allocator_backend()
+            cname = get_backend_cname(allocator_backend)
+
+            # If allocator backend matches the source, reuse objects.
+            if cname == allocator_cname:
+                backend.batched_submit_put_task(
+                    keys_subset, objs_subset, transfer_spec=transfer_spec
+                )
+            else:
+                new_keys, new_objs = allocate_and_copy_objects(
+                    allocator_backend, keys_subset, objs_subset, self.internal_copy_stream
+                )
+                if new_keys:
+                    backend.batched_submit_put_task(
+                        new_keys, new_objs, transfer_spec=transfer_spec
+                    )
+                    for memory_obj in new_objs:
+                        memory_obj.ref_count_down()
+
+        # Release original objects once after all backends are handled.
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
+
+    def _batched_get_with_rnic_routing(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        if not self._rnic_routing_enabled:
+            return [None] * len(keys)
+
+        routing = self._group_keys_by_rnic_backend(keys)
+        if not routing:
+            return [None] * len(keys)
+
+        results: List[Optional[MemoryObj]] = [None] * len(keys)
+        for backend_name, idxs in routing.items():
+            with self._bypass_lock:
+                if backend_name in self._bypassed_backends:
+                    continue
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                continue
+            keys_subset = [keys[i] for i in idxs]
+            objs_subset = backend.batched_get_blocking(keys_subset)
+            for idx, obj in zip(idxs, objs_subset, strict=False):
+                results[idx] = obj
+
+        return results
+
+    def _batched_contains_with_rnic_routing(
+        self,
+        keys: List[CacheEngineKey],
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+    ) -> tuple[int, dict]:
+        total_hit_chunks = 0
+        block_mapping: dict[str, list[CacheEngineKey]] = {}
+        for key in keys:
+            backend_name = self._select_rnic_backend_for_chunk(key)
+            if backend_name is None:
+                break
+            if search_range is not None and backend_name not in search_range:
+                break
+            with self._bypass_lock:
+                if backend_name in self._bypassed_backends:
+                    break
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                break
+            pin_in_backend = pin if backend_name != "PDBackend" else False
+            if backend.contains(key, pin_in_backend):
+                block_mapping.setdefault(backend_name, []).append(key)
+                total_hit_chunks += 1
+                continue
+            break
+        return total_hit_chunks, block_mapping
+
     def put(
         self,
         key: CacheEngineKey,
@@ -398,6 +556,11 @@ class StorageManager:
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
         """
+        if self._rnic_routing_enabled and location is None:
+            self._batched_put_with_rnic_routing(
+                keys=keys, memory_objs=memory_objs, transfer_spec=transfer_spec
+            )
+            return
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
             str,
@@ -489,6 +652,9 @@ class StorageManager:
         """
         Blocking function to get the memory objects from the storages.
         """
+        with self._freeze_lock:
+            if not self._freeze and self._rnic_routing_enabled and location is None:
+                return self._batched_get_with_rnic_routing(keys)
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
@@ -885,6 +1051,11 @@ class StorageManager:
 
         return: Return hit chunks and block mapping by prefix match.
         """
+        with self._freeze_lock:
+            if not self._freeze and self._rnic_routing_enabled and search_range is None:
+                return self._batched_contains_with_rnic_routing(
+                    keys, search_range, pin
+                )
         total_keys = len(keys)
         total_hit_chunks = 0
         block_mapping = {}
@@ -918,6 +1089,22 @@ class StorageManager:
         Block mapping for the given chunk infos, each key is the backend name,
         each value is a list of chunk infos in the backend.
         """
+        with self._freeze_lock:
+            if not self._freeze and self._rnic_routing_enabled:
+                keys = [chunk_info[0] for chunk_info in chunk_infos]
+                hit_chunks, key_mapping = self._batched_contains_with_rnic_routing(
+                    keys, search_range=None, pin=False
+                )
+                if hit_chunks == 0:
+                    return {}
+                key_to_chunk = {ci[0]: ci for ci in chunk_infos[:hit_chunks]}
+                block_mapping: Dict[str, List[Tuple[CacheEngineKey, int, int]]] = {}
+                for backend_name, backend_keys in key_mapping.items():
+                    block_mapping[backend_name] = [
+                        key_to_chunk[k] for k in backend_keys
+                    ]
+                return block_mapping
+
         keys = [chunk_info[0] for chunk_info in chunk_infos]
         total_keys = len(keys)
         block_mapping = {}
