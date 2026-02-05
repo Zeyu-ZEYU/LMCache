@@ -1078,43 +1078,44 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         the gpu buffer size in gpu connector.
         Also, the first request might be a bit slower due to buffer creation.
         """
+        # Always infer vllm_two_major from kv_caches to support CPU-only
+        # layerwise loading (use_gpu=False).
+        if self.use_mla:
+            # MLA format: [num_blocks, block_size, head_size]
+            assert kv_caches[0].dim() == 3, (
+                "For MLA, the kv_caches should have shape [num_blocks, "
+                "block_size, head_size]"
+            )
+            k_cache_shape_per_layer = kv_caches[0].shape
+            max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+            num_elements = k_cache_shape_per_layer.numel()
+            self.vllm_two_major = False  # MLA doesn't need vllm_two_major
+        else:
+            # flash attention: [num_layers, 2, num_blocks, block_size,
+            # num_heads, head_size]
+            # flash infer:
+            # [num_layers, num_blocks, 2, block_size, num_heads, head_size]
+            assert kv_caches[0].shape[0] == 2 or kv_caches[0].shape[1] == 2, (
+                "The kv_caches should have shape [num_layers, 2, num_blocks, "
+                "block_size, num_heads, head_size] or "
+                "[num_layers, num_blocks, 2, block_size, num_heads, head_size]"
+            )
+
+            self.vllm_two_major = kv_caches[0].shape[0] == 2
+
+            if self.vllm_two_major:
+                k_cache_shape_per_layer = kv_caches[0][0].shape
+            else:
+                k_cache_shape_per_layer = kv_caches[0][:, 0].shape
+            max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+            num_elements = k_cache_shape_per_layer.numel() * 2
+
         if self.use_gpu and self.gpu_buffer_allocator is None:
             logger.info("Lazily initializing GPU buffer.")
             # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
             # NOTE (Jiayi): Using the exact number of tokens in the first layer
             # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
             # in layerwise mode.
-
-            if self.use_mla:
-                # MLA format: [num_blocks, block_size, head_size]
-                assert kv_caches[0].dim() == 3, (
-                    "For MLA, the kv_caches should have shape [num_blocks, "
-                    "block_size, head_size]"
-                )
-                k_cache_shape_per_layer = kv_caches[0].shape
-                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
-                num_elements = k_cache_shape_per_layer.numel()
-                self.vllm_two_major = False  # MLA doesn't need vllm_two_major
-            else:
-                # flash attention: [num_layers, 2, num_blocks, block_size,
-                # num_heads, head_size]
-                # flash infer:
-                # [num_layers, num_blocks, 2, block_size, num_heads, head_size]
-                assert kv_caches[0].shape[0] == 2 or kv_caches[0].shape[1] == 2, (
-                    "The kv_caches should have shape [num_layers, 2, num_blocks, "
-                    "block_size, num_heads, head_size] or "
-                    "[num_layers, num_blocks, 2, block_size, num_heads, head_size]"
-                )
-
-                self.vllm_two_major = kv_caches[0].shape[0] == 2
-
-                if self.vllm_two_major:
-                    k_cache_shape_per_layer = kv_caches[0][0].shape
-                else:
-                    k_cache_shape_per_layer = kv_caches[0][:, 0].shape
-                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
-                num_elements = k_cache_shape_per_layer.numel() * 2
-
             logger.info(f"Lazily initializing GPU buffer (max tokens={max_tokens}).")
             gpu_buffer_size = num_elements * self.element_size
             self.gpu_buffer_allocator = GPUMemoryAllocator(

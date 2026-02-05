@@ -13,7 +13,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
@@ -295,8 +295,15 @@ class MooncakestoreConnector(RemoteConnector):
         if not keys:
             return []
 
+        # Layerwise keys require metadata to reconstruct correct shapes.
+        has_layerwise_keys = any(isinstance(key, LayerCacheEngineKey) for key in keys)
+
         # Check if we have metadata for zero-copy operations
-        if self.save_chunk_meta:
+        if self.save_chunk_meta or has_layerwise_keys:
+            if has_layerwise_keys and not self.save_chunk_meta:
+                logger.debug(
+                    "Layerwise keys detected; forcing metadata path for batched_get"
+                )
             # Use legacy mode with metadata stored in remote
             return await self._batch_get_buffer(keys)
         else:
