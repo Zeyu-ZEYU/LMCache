@@ -203,6 +203,8 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+        # lookup_id -> whether lookup hit only via layerwise keys
+        self.lookup_layerwise_only: dict[str, bool] = {}
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -1164,6 +1166,10 @@ class LMCacheEngine:
 
                     if pin and pins_by_location:
                         self.lookup_pins[lookup_id] = pins_by_location
+                    if pin and lookup_id is not None:
+                        self.lookup_layerwise_only[lookup_id] = (
+                            base_hit_chunks == 0 and layerwise_hit_chunks > 0
+                        )
                     logger.info(
                         "Lookup hit summary (layerwise_fallback): lookup_id=%s, "
                         "base_hit_chunks=%d, layerwise_hit_chunks=%d, total_chunks=%d, "
@@ -1457,6 +1463,10 @@ class LMCacheEngine:
             assert self.storage_manager is not None
             for location, keys in self.lookup_pins.pop(lookup_id).items():
                 self.storage_manager.batched_unpin(keys, [location])
+        self.lookup_layerwise_only.pop(lookup_id, None)
+
+    def is_layerwise_only_hit(self, lookup_id: str) -> bool:
+        return self.lookup_layerwise_only.get(lookup_id, False)
 
     @_lmcache_nvtx_annotate
     def clear(

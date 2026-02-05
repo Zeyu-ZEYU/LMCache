@@ -859,14 +859,26 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
+                force_layerwise = self.lmcache_engine.is_layerwise_only_hit(
+                    request.req_id
                 )
+                if force_layerwise:
+                    logger.info(
+                        "Skipping non-layerwise retrieve for req_id=%s (layerwise-only lookup hit)",
+                        request.req_id,
+                    )
+                    ret_token_mask = torch.zeros(
+                        lmcache_cached_tokens, dtype=torch.bool
+                    )
+                else:
+                    ret_token_mask = self.lmcache_engine.retrieve(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                    )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -882,10 +894,16 @@ class LMCacheConnectorV1Impl:
                         & ~ret_token_mask.to(torch.bool)
                     )
                     if missing_mask.any():
-                        logger.warning(
-                            "Non-layerwise retrieve short for req_id=%s; attempting layerwise fallback",
-                            request.req_id,
-                        )
+                        if force_layerwise:
+                            logger.info(
+                                "Attempting layerwise retrieve for req_id=%s (layerwise-only lookup hit)",
+                                request.req_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Non-layerwise retrieve short for req_id=%s; attempting layerwise fallback",
+                                request.req_id,
+                            )
                         old_gpu_connector = self.lmcache_engine.gpu_connector
                         try:
                             from lmcache.v1.gpu_connector import (
