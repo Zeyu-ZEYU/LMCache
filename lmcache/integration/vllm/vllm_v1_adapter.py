@@ -516,6 +516,18 @@ class LMCacheConnectorV1Impl:
                         self.kv_role,
                     )
 
+        # Allow lookup to fall back to layerwise keys on decode when prefill
+        # stores KV layerwise (prefill overlap mode). This does not change
+        # decode retrieval mode (still non-layerwise).
+        if self.kv_role == "kv_consumer":
+            if config.extra_config is None:
+                config.extra_config = {}
+            if "layerwise_lookup_fallback" not in config.extra_config:
+                config.extra_config["layerwise_lookup_fallback"] = True
+                logger.info(
+                    "Enabled layerwise_lookup_fallback for kv_consumer (decode)"
+                )
+
     def _init_connector_state(
         self,
         role: KVConnectorRole,

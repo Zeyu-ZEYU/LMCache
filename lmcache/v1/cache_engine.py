@@ -1108,20 +1108,72 @@ class LMCacheEngine:
                     # chunk_info contains (start, end, key)
                     # chunk_info[2] is the key
                     keys.append(chunk_info[2])
-                # hit chunks by prefix matching
-                hit_chunks, block_mapping = self.storage_manager.batched_contains(
-                    keys, search_range, pin
+
+                allow_layerwise_fallback = self.config.get_extra_config_value(
+                    "layerwise_lookup_fallback", False
                 )
-                if pin and block_mapping:
-                    assert lookup_id is not None, (
-                        "lookup_id is required when pin is True"
+
+                if not allow_layerwise_fallback:
+                    # hit chunks by prefix matching
+                    hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                        keys, search_range, pin
                     )
-                    self.lookup_pins[lookup_id] = block_mapping
-                for idx, (start, end, key) in enumerate(chunk_info_list):
-                    if idx < hit_chunks:
-                        res = end
-                        continue
-                    return res
+                    if pin and block_mapping:
+                        assert lookup_id is not None, (
+                            "lookup_id is required when pin is True"
+                        )
+                        self.lookup_pins[lookup_id] = block_mapping
+                    for idx, (start, end, key) in enumerate(chunk_info_list):
+                        if idx < hit_chunks:
+                            res = end
+                            continue
+                        return res
+                else:
+                    if pin:
+                        assert lookup_id is not None, (
+                            "lookup_id is required when pin is True"
+                        )
+                    pins_by_location: dict[str, list] = defaultdict(list)
+                    base_hit_chunks = 0
+                    layerwise_hit_chunks = 0
+                    for start, end, key in chunk_info_list:
+                        hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                            [key], search_range, pin
+                        )
+                        if hit_chunks == 1 and block_mapping:
+                            base_hit_chunks += 1
+                            if pin:
+                                for location, keys_in_loc in block_mapping.items():
+                                    pins_by_location[location].extend(keys_in_loc)
+                            res = end
+                            continue
+
+                        key_all_layers = key.split_layers(self.num_layers)
+                        hit_layers, block_mapping = self.storage_manager.batched_contains(
+                            key_all_layers, search_range, pin
+                        )
+                        if hit_layers == self.num_layers and len(block_mapping) == 1:
+                            layerwise_hit_chunks += 1
+                            if pin:
+                                for location, keys_in_loc in block_mapping.items():
+                                    pins_by_location[location].extend(keys_in_loc)
+                            res = end
+                            continue
+
+                        return res
+
+                    if pin and pins_by_location:
+                        self.lookup_pins[lookup_id] = pins_by_location
+                    logger.info(
+                        "Lookup hit summary (layerwise_fallback): lookup_id=%s, "
+                        "base_hit_chunks=%d, layerwise_hit_chunks=%d, total_chunks=%d, "
+                        "hit_tokens=%d",
+                        lookup_id,
+                        base_hit_chunks,
+                        layerwise_hit_chunks,
+                        len(chunk_info_list),
+                        res,
+                    )
 
             # all tokens where found, return the maximal end
             return res
