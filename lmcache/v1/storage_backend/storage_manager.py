@@ -28,6 +28,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
     CacheEngineKey,
+    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
     start_loop_in_thread_with_exceptions,
 )
@@ -334,11 +335,21 @@ class StorageManager:
                 )
             )
 
-    def _select_rnic_label_for_chunk(self, key: CacheEngineKey) -> str:
+    def _select_rnic_label_for_layer_chunk(
+        self, key: CacheEngineKey, layer_id: Optional[int]
+    ) -> str:
         # TODO: replace with a smarter policy.
-        # Default: route all chunks to the tail RNIC.
+        # Default: route all layer/chunk pairs to the tail RNIC.
         # Change the return value to "head" for quick testing.
+        #
+        # You can use key.chunk_hash and layer_id to make deterministic
+        # per-layer/per-chunk decisions (important for cross-process consistency).
+        # If layer_id is None (base keys), consider always returning "tail".
         return "tail"
+
+    def _select_rnic_label_for_chunk(self, key: CacheEngineKey) -> str:
+        layer_id = key.layer_id if isinstance(key, LayerCacheEngineKey) else None
+        return self._select_rnic_label_for_layer_chunk(key, layer_id)
 
     def _select_rnic_backend_for_chunk(self, key: CacheEngineKey) -> Optional[str]:
         if not self._rnic_routing_enabled:
@@ -357,11 +368,6 @@ class StorageManager:
             if backend_name is None:
                 return {}
             groups.setdefault(backend_name, []).append(idx)
-        logger.debug(
-            "RNIC routing grouped %d keys into: %s",
-            len(keys),
-            {k: len(v) for k, v in groups.items()},
-        )
         return groups
 
     def _get_allocator_backend(
@@ -431,11 +437,6 @@ class StorageManager:
         routing = self._group_keys_by_rnic_backend(keys)
         if not routing:
             return
-        logger.debug(
-            "RNIC routing batched_put: total_keys=%d, backends=%s",
-            len(keys),
-            list(routing.keys()),
-        )
 
         # Import locally to avoid a heavy import at module load.
         from lmcache.v1.storage_backend.remote_backend import RemoteBackend
@@ -503,11 +504,6 @@ class StorageManager:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
                 continue
-            logger.debug(
-                "RNIC routing batched_get: backend=%s keys=%d",
-                backend_name,
-                len(idxs),
-            )
             keys_subset = [keys[i] for i in idxs]
             objs_subset = backend.batched_get_blocking(keys_subset)
             for idx, obj in zip(idxs, objs_subset, strict=False):
@@ -541,11 +537,12 @@ class StorageManager:
                 total_hit_chunks += 1
                 continue
             break
-        logger.debug(
-            "RNIC routing batched_contains: hit_chunks=%d, locations=%s",
-            total_hit_chunks,
-            list(block_mapping.keys()),
-        )
+        if total_hit_chunks > 0:
+            logger.debug(
+                "RNIC routing batched_contains: hit_chunks=%d, locations=%s",
+                total_hit_chunks,
+                list(block_mapping.keys()),
+            )
         return total_hit_chunks, block_mapping
 
     def put(
@@ -719,6 +716,39 @@ class StorageManager:
 
         :return: A generator that yields a future for each layer.
         """
+        if location is None and self._rnic_routing_enabled:
+            for layer_idx, keys_multi_chunk in enumerate(keys):
+                routing = self._group_keys_by_rnic_backend(keys_multi_chunk)
+                if not routing:
+                    routing = {"LocalCPUBackend": list(range(len(keys_multi_chunk)))}
+                logger.debug(
+                    "RNIC layerwise route: layer=%d total_chunks=%d backend_counts=%s",
+                    layer_idx,
+                    len(keys_multi_chunk),
+                    {k: len(v) for k, v in routing.items()},
+                )
+
+                async def _layer_get_multi_backend(
+                    routing_groups: dict[str, list[int]],
+                    layer_keys: list[CacheEngineKey],
+                ) -> list[MemoryObj]:
+                    results: list[Optional[MemoryObj]] = [None] * len(layer_keys)
+                    for backend_name, idxs in routing_groups.items():
+                        backend = self.storage_backends[backend_name]
+                        keys_subset = [layer_keys[i] for i in idxs]
+                        objs_subset = await backend.batched_get_non_blocking(
+                            "fake_lookup_id",
+                            keys_subset,
+                        )
+                        for idx, obj in zip(idxs, objs_subset, strict=False):
+                            results[idx] = obj
+                    return cast(list[MemoryObj], results)
+
+                coro = _layer_get_multi_backend(routing, keys_multi_chunk)
+                task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+                yield task
+            return
+
         if location is None:
             location = "LocalCPUBackend"
         for keys_multi_chunk in keys:

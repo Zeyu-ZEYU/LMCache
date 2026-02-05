@@ -922,6 +922,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
+        rnic_enabled = getattr(self.storage_manager, "_rnic_routing_enabled", False)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -931,19 +932,30 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
-            # NOTE: Only check the first layer
-            if current_location := self.storage_manager.contains(keys_multi_layer[0]):
-                if location is None:
-                    location = current_location
-                else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
-                    )
+            if rnic_enabled:
+                hit_layers, _ = self.storage_manager.batched_contains(
+                    keys_multi_layer,
+                    search_range=None,
+                    pin=False,
+                )
+                if hit_layers != self.num_layers:
+                    break
             else:
-                break
+                # NOTE: Only check the first layer when RNIC routing is disabled.
+                if current_location := self.storage_manager.contains(
+                    keys_multi_layer[0]
+                ):
+                    if location is None:
+                        location = current_location
+                    else:
+                        # TODO(Jiayi): Support multi-location retrieval in the future
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval."
+                            "Please support multi-location retrieval in the future."
+                        )
+                else:
+                    break
 
             starts.append(start)
             ends.append(end)
@@ -957,7 +969,7 @@ class LMCacheEngine:
 
             get_generator = self.storage_manager.layerwise_batched_get(
                 keys_layer_major,
-                location=location,
+                location=None if rnic_enabled else location,
             )
 
             assert isinstance(
@@ -1154,7 +1166,7 @@ class LMCacheEngine:
                         hit_layers, block_mapping = self.storage_manager.batched_contains(
                             key_all_layers, search_range, pin
                         )
-                        if hit_layers == self.num_layers and len(block_mapping) == 1:
+                        if hit_layers == self.num_layers:
                             layerwise_hit_chunks += 1
                             if pin:
                                 for location, keys_in_loc in block_mapping.items():
