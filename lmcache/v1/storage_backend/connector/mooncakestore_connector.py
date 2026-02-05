@@ -303,6 +303,35 @@ class MooncakestoreConnector(RemoteConnector):
             # Use optimized mode with local metadata
             return await self._batch_get_into(keys)
 
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        """
+        Non-blocking batched get. Mooncake does not support single-key get,
+        so we reuse batched_get and then return the consecutive prefix of
+        successfully retrieved MemoryObjs (same semantics as base connector).
+        """
+        try:
+            results = await self.batched_get(keys)
+        except Exception as e:
+            logger.warning(f"Exception during batched get: {e}")
+            return []
+
+        memory_objs: list[MemoryObj] = []
+        found_failure = False
+        for result in results:
+            if found_failure:
+                if isinstance(result, MemoryObj):
+                    result.ref_count_down()
+            elif isinstance(result, MemoryObj):
+                memory_objs.append(result)
+            else:
+                found_failure = True
+
+        return memory_objs
+
     def support_batched_async_contains(self) -> bool:
         return True
 
