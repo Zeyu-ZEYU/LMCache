@@ -870,6 +870,7 @@ class LMCacheEngine:
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
+        gpu_connector: Optional["GPUConnectorInterface"] = None,
         **kwargs,
     ) -> Generator[Optional[torch.Tensor], None, None]:
         """
@@ -901,7 +902,9 @@ class LMCacheEngine:
             return
 
         assert self.storage_manager is not None
-        assert self.gpu_connector is not None, (
+        if gpu_connector is None:
+            gpu_connector = self.gpu_connector
+        assert gpu_connector is not None, (
             "gpu_connector is required for retrieve_layer operation"
         )
 
@@ -973,14 +976,14 @@ class LMCacheEngine:
             )
 
             assert isinstance(
-                self.gpu_connector,
+                gpu_connector,
                 (
                     VLLMPagedMemLayerwiseGPUConnector,
                     VLLMBufferLayerwiseGPUConnector,
                     SGLangLayerwiseGPUConnector,
                 ),
             )
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+            mem_obj_consumer = gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
 
             to_count_down = []

@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 
     # First Party
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
+    from lmcache.v1.gpu_connector import VLLMPagedMemLayerwiseGPUConnector
 
 logger = init_logger(__name__)
 
@@ -592,6 +593,42 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        self._fallback_layerwise_gpu_connector: Optional[
+            "VLLMPagedMemLayerwiseGPUConnector"
+        ] = None
+        self._fallback_layerwise_gpu_connector_sig: Optional[tuple] = None
+
+    def _get_or_create_fallback_layerwise_gpu_connector(
+        self,
+    ) -> "VLLMPagedMemLayerwiseGPUConnector":
+        from lmcache.v1.gpu_connector import VLLMPagedMemLayerwiseGPUConnector
+
+        assert self.lmcache_engine is not None
+        metadata = self.lmcache_engine.metadata
+        signature = (
+            tuple(metadata.kv_shape),
+            metadata.kv_dtype,
+            bool(metadata.use_mla),
+            str(self.device),
+        )
+
+        if (
+            self._fallback_layerwise_gpu_connector is None
+            or self._fallback_layerwise_gpu_connector_sig != signature
+        ):
+            self._fallback_layerwise_gpu_connector = (
+                VLLMPagedMemLayerwiseGPUConnector.from_metadata(
+                    metadata,
+                    use_gpu=False,
+                    device=self.device,
+                )
+            )
+            self._fallback_layerwise_gpu_connector_sig = signature
+            logger.debug(
+                "Initialized cached layerwise fallback connector (connector=%s)",
+                self._fallback_layerwise_gpu_connector.__class__.__name__,
+            )
+        return self._fallback_layerwise_gpu_connector
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -904,36 +941,23 @@ class LMCacheConnectorV1Impl:
                                 "Non-layerwise retrieve short for req_id=%s; attempting layerwise fallback",
                                 request.req_id,
                             )
-                        old_gpu_connector = self.lmcache_engine.gpu_connector
                         try:
-                            from lmcache.v1.gpu_connector import (
-                                VLLMBufferLayerwiseGPUConnector,
-                                VLLMPagedMemLayerwiseGPUConnector,
+                            layerwise_connector = (
+                                self._get_or_create_fallback_layerwise_gpu_connector()
                             )
-
-                            if self.enable_blending:
-                                layerwise_connector = (
-                                    VLLMBufferLayerwiseGPUConnector.from_metadata(
-                                        self.lmcache_engine.metadata,
-                                        use_gpu=False,
-                                        device=self.device,
-                                    )
-                                )
-                            else:
-                                layerwise_connector = (
-                                    VLLMPagedMemLayerwiseGPUConnector.from_metadata(
-                                        self.lmcache_engine.metadata,
-                                        use_gpu=False,
-                                        device=self.device,
-                                    )
-                                )
-
-                            self.lmcache_engine.gpu_connector = layerwise_connector
+                            logger.debug(
+                                "Layerwise fallback using temporary connector for req_id=%s "
+                                "(missing_tokens=%d, connector=%s)",
+                                request.req_id,
+                                int(missing_mask.sum().item()),
+                                layerwise_connector.__class__.__name__,
+                            )
 
                             layerwise_ret_mask: Optional[torch.Tensor] = None
                             layerwise_retriever = self.lmcache_engine.retrieve_layer(
                                 tokens[:lmcache_cached_tokens],
                                 missing_mask,
+                                gpu_connector=layerwise_connector,
                                 kvcaches=kvcaches,
                                 slot_mapping=slot_mapping[:lmcache_cached_tokens],
                                 sync=True,
@@ -964,8 +988,6 @@ class LMCacheConnectorV1Impl:
                                 "Layerwise fallback retrieve failed for request %s",
                                 request.req_id,
                             )
-                        finally:
-                            self.lmcache_engine.gpu_connector = old_gpu_connector
 
                     num_retrieved_tokens = ret_token_mask.sum().item()
 
