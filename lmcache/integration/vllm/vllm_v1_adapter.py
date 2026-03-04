@@ -83,6 +83,7 @@ class DisaggSpec:
     receiver_host: str
     receiver_init_port: int
     receiver_alloc_port: int
+    receiver_mooncake_segment: Optional[str] = None
     is_last_prefill: bool = False
     num_transferred_tokens: int = 0
 
@@ -1505,6 +1506,9 @@ class LMCacheConnectorV1Impl:
                 receiver_host=req_disagg_spec["receiver_host"],
                 receiver_init_port=req_disagg_spec["receiver_init_port"],
                 receiver_alloc_port=req_disagg_spec["receiver_alloc_port"],
+                receiver_mooncake_segment=req_disagg_spec.get(
+                    "receiver_mooncake_segment"
+                ),
             )
 
             tmp_disagg_tracker[request.request_id] = disagg_spec

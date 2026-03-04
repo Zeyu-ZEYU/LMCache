@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, List, Optional
 import abc
 import asyncio
 
@@ -242,13 +242,17 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         return False
 
     async def batched_put(
-        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
+        self,
+        keys: List[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
     ):
         """
         Batched put the memory_objs with the corresponding keys
         Input:
             keys: the keys of the corresponding objects
             memory_objs: the memory_objs of the corresponding keys
+            transfer_spec: optional transfer metadata passed by LMCache
         """
         raise NotImplementedError
 

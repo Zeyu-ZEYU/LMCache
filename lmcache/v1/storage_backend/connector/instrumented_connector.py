@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, List, Optional
 import time
 
 # First Party
@@ -172,7 +172,10 @@ class InstrumentedRemoteConnector(RemoteConnector):
         return memory_objs
 
     async def batched_put(
-        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
+        self,
+        keys: List[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
     ):
         total_size = sum(
             memory_obj.get_size()
@@ -181,7 +184,19 @@ class InstrumentedRemoteConnector(RemoteConnector):
         )
         begin = time.perf_counter()
         try:
-            await self._connector.batched_put(keys, memory_objs)
+            if transfer_spec is None:
+                await self._connector.batched_put(keys, memory_objs)
+            else:
+                try:
+                    await self._connector.batched_put(
+                        keys,
+                        memory_objs,
+                        transfer_spec=transfer_spec,
+                    )
+                except TypeError as exc:
+                    if "transfer_spec" not in str(exc):
+                        raise
+                    await self._connector.batched_put(keys, memory_objs)
         except Exception as e:
             logger.warning(f"batched put error: {e}")
         finally:

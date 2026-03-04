@@ -9,6 +9,7 @@ import asyncio
 import itertools
 import json
 import os
+import random
 import time
 
 # Third Party
@@ -36,6 +37,11 @@ async def lifespan(app: FastAPI):
     Lifespan context manager to handle startup and shutdown events.
     """
     # Startup: Initialize clients
+    app.state.prefill_clients.clear()
+    app.state.decode_clients.clear()
+    app.state.total_clients.clear()
+    app.state.decode_segments.clear()
+    app.state.decode_client_by_segment.clear()
 
     # Build prefill clients with CSV-based broadcast pairing
     pref_hosts = global_args.prefiller_host
@@ -103,6 +109,7 @@ async def lifespan(app: FastAPI):
     for i, (host, port) in enumerate(decoder_pairs):
         decoder_base_url = f"http://{host}:{int(port)}"
         decode_client = httpx.AsyncClient(timeout=None, base_url=decoder_base_url)
+        mooncake_segment = f"{host}:{int(port)}"
         if incremental_mode:
             init_ports = [p + i for p in global_args.decoder_init_port]
             alloc_ports = [p + i for p in global_args.decoder_alloc_port]
@@ -118,8 +125,11 @@ async def lifespan(app: FastAPI):
                 host,
                 init_ports,
                 alloc_ports,
+                mooncake_segment,
             )
         )
+        app.state.decode_segments.append(mooncake_segment)
+        app.state.decode_client_by_segment[mooncake_segment] = app.state.decode_clients[-1]
 
     app.state.total_clients = app.state.prefill_clients + app.state.decode_clients
 
@@ -209,12 +219,15 @@ class ClientInfo:
     host: Optional[str] = None
     init_port: Optional[list[int]] = None
     alloc_port: Optional[list[int]] = None
+    mooncake_segment: Optional[str] = None
 
 
 # Initialize variables to hold the persistent clients
 app.state.prefill_clients = []
 app.state.decode_clients = []
 app.state.total_clients = []
+app.state.decode_segments = []
+app.state.decode_client_by_segment = {}
 
 """
 client_request and prefill/decode map
@@ -350,6 +363,30 @@ def pick_up_clients(request: Request) -> tuple[ClientInfo, ClientInfo, ClientInf
     return round_robin_pick_clients()
 
 
+def select_decode_segment_for_prefill(req_id: str, decode_segments: list[str]) -> str:
+    """
+    A stub selector for decode node selection.
+    """
+    _ = req_id
+    return random.choice(decode_segments)
+
+
+def pick_decode_target(req_id: str) -> tuple[ClientInfo, str]:
+    decode_segments = app.state.decode_segments
+    assert len(decode_segments) > 0, "No decode segments configured in proxy server"
+    selected_segment = select_decode_segment_for_prefill(req_id, decode_segments)
+    decode_client = app.state.decode_client_by_segment.get(selected_segment)
+    if decode_client is None:
+        logger.warning(
+            "Selected decode segment %s not found, fallback to random decode client.",
+            selected_segment,
+        )
+        decode_client = random.choice(app.state.decode_clients)
+        selected_segment = decode_client.mooncake_segment or selected_segment
+    logger.debug("Req %s selected decode segment %s", req_id, selected_segment)
+    return decode_client, selected_segment
+
+
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
     global counter, stats_calculator
@@ -360,8 +397,9 @@ async def handle_completions(request: Request):
     try:
         req_data = await request.json()
 
-        # Pick tokenization, prefill and decode client
-        tokenization_client, prefill_client, decode_client = pick_up_clients(request)
+        # Pick tokenization and prefill client
+        tokenization_client, prefill_client, _ = pick_up_clients(request)
+        decode_client, decode_segment = pick_decode_target(req_id)
 
         tokenize_output = await send_request_to_service(
             tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
@@ -377,6 +415,7 @@ async def handle_completions(request: Request):
             "receiver_host": decode_client.host,
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
+            "receiver_mooncake_segment": decode_segment,
         }
         num_tp_rank = len(decode_client.init_port or [])
 
@@ -459,8 +498,9 @@ async def handle_chat_completions(request: Request):
     try:
         req_data = await request.json()
 
-        # Pick tokenization, prefill and decode client
-        tokenization_client, prefill_client, decode_client = pick_up_clients(request)
+        # Pick tokenization and prefill client
+        tokenization_client, prefill_client, _ = pick_up_clients(request)
+        decode_client, decode_segment = pick_decode_target(req_id)
 
         # For chat completions, we need to tokenize the messages
         tokenize_output = await send_request_to_service(
@@ -482,6 +522,7 @@ async def handle_chat_completions(request: Request):
             "receiver_host": decode_client.host,
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
+            "receiver_mooncake_segment": decode_segment,
         }
 
         num_tp_rank = len(decode_client.init_port or [])

@@ -2,7 +2,7 @@
 # Standard
 from dataclasses import dataclass
 from functools import reduce
-from typing import List, Optional, no_type_check
+from typing import Any, List, Optional, no_type_check
 import asyncio
 import json
 import operator
@@ -227,6 +227,7 @@ class MooncakestoreConnector(RemoteConnector):
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = 1
+        self._replicate_config_cls = ReplicateConfig
 
         # Set preferred_segment based on configuration
         if self.config.prefer_local_alloc:
@@ -269,6 +270,39 @@ class MooncakestoreConnector(RemoteConnector):
             else:
                 logger.warning(f"Buffer unregistration failed: error={result}")
             self.registered_buffer_ptr = None
+
+    def _extract_receiver_segment(self, transfer_spec: Any) -> Optional[str]:
+        if transfer_spec is None:
+            return None
+
+        if isinstance(transfer_spec, dict):
+            segment = transfer_spec.get("receiver_mooncake_segment")
+        else:
+            segment = getattr(transfer_spec, "receiver_mooncake_segment", None)
+
+        if segment is None:
+            return None
+        segment = str(segment).strip()
+        return segment if segment else None
+
+    def _build_replicate_config(self, transfer_spec: Any = None):
+        cfg = self._replicate_config_cls()
+        cfg.replica_num = self.replica_config.replica_num
+        cfg.with_soft_pin = self.replica_config.with_soft_pin
+        cfg.prefer_alloc_in_same_node = self.replica_config.prefer_alloc_in_same_node
+
+        preferred_segment = self._extract_receiver_segment(transfer_spec)
+        if preferred_segment is None:
+            preferred_segment = self.replica_config.preferred_segment
+
+        if preferred_segment:
+            cfg.preferred_segment = preferred_segment
+            if hasattr(cfg, "preferred_segments"):
+                cfg.preferred_segments = [preferred_segment]
+        elif hasattr(self.replica_config, "preferred_segments"):
+            cfg.preferred_segments = list(self.replica_config.preferred_segments)
+
+        return cfg
 
     def support_batched_get(self) -> bool:
         """
@@ -515,7 +549,12 @@ class MooncakestoreConnector(RemoteConnector):
         else:
             return None
 
-    async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
+    async def put(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        transfer_spec: Any = None,
+    ):
         """
         Put operation with metadata-consistent handling.
         Uses put_from (without metadata) or
@@ -526,10 +565,18 @@ class MooncakestoreConnector(RemoteConnector):
         # Check metadata handling mode to match get behavior
         if self.save_chunk_meta:
             # Use put_parts with metadata stored remotely
-            await self._put_with_metadata(key_str, memory_obj)
+            await self._put_with_metadata(
+                key_str,
+                memory_obj,
+                transfer_spec=transfer_spec,
+            )
         else:
             # Use put_from without metadata (zero-copy)
-            await self._put_without_metadata(key_str, memory_obj)
+            await self._put_without_metadata(
+                key_str,
+                memory_obj,
+                transfer_spec=transfer_spec,
+            )
 
     def support_batched_put(self) -> bool:
         return True
@@ -538,6 +585,7 @@ class MooncakestoreConnector(RemoteConnector):
         self,
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
     ):
         """
         Batched put with clear split by metadata mode.
@@ -548,14 +596,23 @@ class MooncakestoreConnector(RemoteConnector):
             return
 
         if self.save_chunk_meta:
-            await self._batched_put_with_metadata(keys, memory_objs)
+            await self._batched_put_with_metadata(
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+            )
         else:
-            await self._batched_put_zero_copy(keys, memory_objs)
+            await self._batched_put_zero_copy(
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+            )
 
     async def _batched_put_zero_copy(
         self,
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
     ) -> None:
         key_strs = [k.to_string() for k in keys]
         buffer_ptrs: list[int] = []
@@ -566,6 +623,8 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptrs.append(tensor.data_ptr())
             buffer_sizes.append(tensor.numel() * tensor.element_size())
 
+        replicate_config = self._build_replicate_config(transfer_spec=transfer_spec)
+
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -573,7 +632,7 @@ class MooncakestoreConnector(RemoteConnector):
                     key_strs,
                     buffer_ptrs,
                     buffer_sizes,
-                    self.replica_config,
+                    replicate_config,
                 ),
                 timeout=self.config.transfer_timeout,
             )
@@ -586,11 +645,21 @@ class MooncakestoreConnector(RemoteConnector):
         self,
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
     ) -> None:
         for key, obj in zip(keys, memory_objs, strict=False):
-            await self._put_with_metadata(key.to_string(), obj)
+            await self._put_with_metadata(
+                key.to_string(),
+                obj,
+                transfer_spec=transfer_spec,
+            )
 
-    async def _put_without_metadata(self, key_str: str, memory_obj: MemoryObj):
+    async def _put_without_metadata(
+        self,
+        key_str: str,
+        memory_obj: MemoryObj,
+        transfer_spec: Any = None,
+    ):
         """
         Zero-copy put using put_from when metadata is not stored remotely.
         This is used when save_chunk_meta=False (matches _batch_get_into).
@@ -601,13 +670,17 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptr = tensor.data_ptr()
             buffer_size = tensor.numel() * tensor.element_size()
 
+            replicate_config = self._build_replicate_config(
+                transfer_spec=transfer_spec
+            )
+
             await asyncio.wait_for(
                 asyncio.to_thread(
                     self.store.put_from,
                     key_str,
                     buffer_ptr,
                     buffer_size,
-                    self.replica_config,
+                    replicate_config,
                 ),
                 timeout=self.config.transfer_timeout,
             )
@@ -623,7 +696,12 @@ class MooncakestoreConnector(RemoteConnector):
             )
             raise
 
-    async def _put_with_metadata(self, key_str: str, memory_obj: MemoryObj):
+    async def _put_with_metadata(
+        self,
+        key_str: str,
+        memory_obj: MemoryObj,
+        transfer_spec: Any = None,
+    ):
         """
         Put using put_parts when metadata is stored remotely.
         This is used when save_chunk_meta=True (matches _batch_get_buffer).
@@ -639,10 +717,17 @@ class MooncakestoreConnector(RemoteConnector):
                 len(kv_bytes), kv_shapes, kv_dtypes, memory_format
             ).serialize()
             assert len(metadata_bytes) == METADATA_BYTES_LEN
+            replicate_config = self._build_replicate_config(
+                transfer_spec=transfer_spec
+            )
 
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.store.put_parts, key_str, metadata_bytes, kv_bytes
+                    self.store.put_parts,
+                    key_str,
+                    metadata_bytes,
+                    kv_bytes,
+                    config=replicate_config,
                 ),
                 timeout=self.config.transfer_timeout,
             )

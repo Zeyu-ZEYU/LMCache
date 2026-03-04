@@ -300,8 +300,22 @@ class RemoteBackend(StorageBackendInterface):
                                 f"on_complete_callback failed for key {key}: {e}"
                             )
 
+            try:
+                batched_put_coro = self.connection.batched_put(  # type: ignore
+                    keys,
+                    compressed_memory_objs,
+                    transfer_spec=transfer_spec,
+                )
+            except TypeError as exc:
+                if "transfer_spec" not in str(exc):
+                    raise
+                batched_put_coro = self.connection.batched_put(  # type: ignore
+                    keys,
+                    compressed_memory_objs,
+                )
+
             future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
+                batched_put_coro,
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)
