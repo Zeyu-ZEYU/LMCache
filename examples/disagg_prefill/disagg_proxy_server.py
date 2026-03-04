@@ -428,7 +428,7 @@ async def handle_completions(request: Request):
             ).encode()
 
             # Wait until decode node signals that kv is ready
-            await wait_decode_kv_ready(req_id, num_tp_rank)
+            # await wait_decode_kv_ready(req_id, num_tp_rank)
 
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
@@ -554,7 +554,7 @@ async def handle_chat_completions(request: Request):
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
-            await wait_decode_kv_ready(req_id, num_tp_rank)
+            # await wait_decode_kv_ready(req_id, num_tp_rank)
 
             # Stream and convert completion format chunks to chat completion format
             async for chunk in stream_service_response(
