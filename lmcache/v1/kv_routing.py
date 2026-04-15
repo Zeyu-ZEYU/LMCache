@@ -35,4 +35,5 @@ def route_kv_chunk(
       - Use a percentage: e.g., return "head" if chunk_id < num_chunks * 0.3
         to send 30% of chunks via head NIC.
     """
-    return "tail"
+    # TEMP: all head for experiment
+    return "head"
