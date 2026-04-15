@@ -1693,13 +1693,8 @@ class LMCacheConnectorV1Impl:
         # NOTE: Used to stream back the first token
         # for disagg prefill
         if params is not None and "ret_first_tok" in params:
-            first_tok = (
-                request._output_token_ids[0]
-                if request._output_token_ids
-                else 0
-            )
             return_params = {
-                "first_tok": first_tok,
+                "first_tok": request._output_token_ids[0],
             }
 
         if self.config.get_extra_config_value(

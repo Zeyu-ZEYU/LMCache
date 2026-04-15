@@ -529,7 +529,7 @@ class MooncakestoreConnector(RemoteConnector):
         # decode node for KV overlap), otherwise use the default config.
         replica_cfg = self.replica_config
         if preferred_segment:
-            from mooncake.mooncake_store_py import ReplicateConfig
+            from mooncake.store import ReplicateConfig
 
             replica_cfg = ReplicateConfig()
             replica_cfg.replica_num = self.replica_config.replica_num
