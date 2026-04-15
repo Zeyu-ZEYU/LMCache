@@ -382,6 +382,8 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
+        layer_id: Optional[int] = None,
+        num_layers: int = 0,
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
@@ -421,7 +423,12 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            backend.batched_submit_put_task(
+                ks, objs,
+                transfer_spec=transfer_spec,
+                layer_id=layer_id,
+                num_layers=num_layers,
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:

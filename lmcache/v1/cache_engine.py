@@ -731,6 +731,8 @@ class LMCacheEngine:
                     memory_objs[layer_id],
                     transfer_spec=transfer_spec,
                     location=self.store_location,
+                    layer_id=layer_id,
+                    num_layers=self.num_layers,
                 )
 
             tot_time = time.perf_counter() - t_start

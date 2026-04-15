@@ -3,8 +3,12 @@
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
+import copy
 import threading
 import time
+
+# Third Party
+import yaml
 
 # First Party
 from lmcache.logging import init_logger
@@ -12,6 +16,7 @@ from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
+from lmcache.v1.kv_routing import route_kv_chunk
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
@@ -78,6 +83,11 @@ class RemoteBackend(StorageBackendInterface):
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
+        # --- Head NIC splitting ---
+        self.head_connection: Optional[RemoteConnector] = None
+        if config.enable_head_nic_split and config.head_nic_config_file:
+            self._init_head_nic_connector(config, metadata, loop, local_cpu_backend)
+
         # NOTE: Health monitoring is now handled at the LMCacheEngine level
         # through HealthMonitor. RemoteBackend no longer manages its own
         # health monitoring. The HealthMonitor in LMCacheEngine will
@@ -87,6 +97,43 @@ class RemoteBackend(StorageBackendInterface):
 
         self._get_blocking_failed_count = 0
         self._put_failed_count = 0
+
+    def _init_head_nic_connector(
+        self,
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+        loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: Optional[LocalCPUBackend],
+    ):
+        """Create a second Mooncake connector for head NIC (mlx5_0)."""
+        try:
+            with open(config.head_nic_config_file, "r") as f:
+                head_cfg = yaml.safe_load(f)
+
+            # Build a modified config for the head NIC connector
+            head_config = copy.copy(config)
+            head_url = head_cfg.get("remote_url", config.remote_url)
+            head_config.remote_url = head_url
+
+            # Override extra_config with head NIC params
+            head_extra = head_cfg.get("extra_config", {})
+            head_config.extra_config = head_extra
+
+            self.head_connection = CreateConnector(
+                head_url,
+                loop,
+                local_cpu_backend,
+                head_config,
+                metadata,
+            )
+            logger.info(
+                "Head NIC connector initialized: url=%s device=%s",
+                head_url,
+                head_extra.get("device_name", "unknown"),
+            )
+        except Exception:
+            logger.exception("Failed to initialize head NIC connector")
+            self.head_connection = None
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -261,12 +308,16 @@ class RemoteBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+        layer_id: Optional[int] = None,
+        num_layers: int = 0,
     ) -> None:
         """
         Submit batched put tasks to store KV caches to remote storage.
 
         :param on_complete_callback: Optional callback invoked once per key
             after that key's write completes (not once per batch).
+        :param layer_id: Layer index for head NIC routing (optional).
+        :param num_layers: Total layers for head NIC routing.
         """
         if self.connection is None:
             logger.warning(
@@ -318,13 +369,50 @@ class RemoteBackend(StorageBackendInterface):
             if preferred_segment:
                 put_kwargs["preferred_segment"] = preferred_segment
 
-            future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(
-                    keys, compressed_memory_objs, **put_kwargs
-                ),
-                self.loop,
-            )
-            future.add_done_callback(batched_done_callback)
+            # --- Head NIC routing ---
+            if (
+                self.head_connection is not None
+                and layer_id is not None
+            ):
+                num_chunks = len(keys)
+                head_idx = []
+                tail_idx = []
+                for ci in range(num_chunks):
+                    nic = route_kv_chunk(
+                        layer_id, ci, num_layers, num_chunks
+                    )
+                    if nic == "head":
+                        head_idx.append(ci)
+                    else:
+                        tail_idx.append(ci)
+
+                if head_idx:
+                    h_keys = [keys[i] for i in head_idx]
+                    h_objs = [compressed_memory_objs[i] for i in head_idx]
+                    hf = asyncio.run_coroutine_threadsafe(
+                        self.head_connection.batched_put(h_keys, h_objs),
+                        self.loop,
+                    )
+                    hf.add_done_callback(batched_done_callback)
+                if tail_idx:
+                    t_keys = [keys[i] for i in tail_idx]
+                    t_objs = [compressed_memory_objs[i] for i in tail_idx]
+                    tf = asyncio.run_coroutine_threadsafe(
+                        self.connection.batched_put(
+                            t_keys, t_objs, **put_kwargs
+                        ),
+                        self.loop,
+                    )
+                    tf.add_done_callback(batched_done_callback)
+            else:
+                # Default: all chunks via tail (main connection)
+                future = asyncio.run_coroutine_threadsafe(
+                    self.connection.batched_put(
+                        keys, compressed_memory_objs, **put_kwargs
+                    ),
+                    self.loop,
+                )
+                future.add_done_callback(batched_done_callback)
         else:
             for key, memory_obj in zip(keys, memory_objs, strict=False):
                 self.submit_put_task(
@@ -387,9 +475,29 @@ class RemoteBackend(StorageBackendInterface):
     def put_failed_count(self):
         return self._put_failed_count
 
+    def _batched_get_from_connection(
+        self,
+        conn: RemoteConnector,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """Helper: batched get from a specific connector."""
+        if conn.support_batched_get():
+            future = asyncio.run_coroutine_threadsafe(
+                conn.batched_get(keys), self.loop
+            )
+            try:
+                return future.result(self.config.blocking_timeout_secs)
+            except Exception as e:
+                if isinstance(e, TimeoutError):
+                    future.cancel()
+                logger.warning("_batched_get_from_connection error: %s", e)
+                return [None] * len(keys)
+        return [None] * len(keys)
+
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        num_layers: int = 0,
     ) -> List[Optional[MemoryObj]]:
         # Check if local_cpu_backend is available (required for memory allocation)
         if self.local_cpu_backend is None:
@@ -408,7 +516,48 @@ class RemoteBackend(StorageBackendInterface):
             keys = [key.with_new_worker_id(0) for key in keys]
 
         t1 = time.perf_counter()
-        # batched get
+
+        # --- Head NIC routing for retrieve ---
+        if self.head_connection is not None and keys:
+            layer_id = getattr(keys[0], "layer_id", None)
+            if layer_id is not None:
+                num_chunks = len(keys)
+                head_idx = []
+                tail_idx = []
+                for ci in range(num_chunks):
+                    nic = route_kv_chunk(
+                        layer_id, ci, num_layers, num_chunks
+                    )
+                    if nic == "head":
+                        head_idx.append(ci)
+                    else:
+                        tail_idx.append(ci)
+
+                if head_idx and not tail_idx:
+                    # All head — retrieve from head connector
+                    return self._batched_get_from_connection(
+                        self.head_connection, keys
+                    )
+                elif tail_idx and not head_idx:
+                    pass  # Fall through to normal path
+                elif head_idx and tail_idx:
+                    # Mixed: query both, merge results
+                    results: list[Optional[MemoryObj]] = [None] * num_chunks
+                    h_keys = [keys[i] for i in head_idx]
+                    t_keys = [keys[i] for i in tail_idx]
+                    h_objs = self._batched_get_from_connection(
+                        self.head_connection, h_keys
+                    )
+                    t_objs = self._batched_get_from_connection(
+                        self.connection, t_keys
+                    )
+                    for i, idx in enumerate(head_idx):
+                        results[idx] = h_objs[i] if h_objs else None
+                    for i, idx in enumerate(tail_idx):
+                        results[idx] = t_objs[i] if t_objs else None
+                    return results
+
+        # batched get (default: tail only)
         if self.connection.support_batched_get():
             future = asyncio.run_coroutine_threadsafe(
                 self.connection.batched_get(keys), self.loop

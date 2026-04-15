@@ -81,6 +81,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
+    # Head NIC splitting: route some KV chunks via management RNIC
+    "enable_head_nic_split": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "head_nic_config_file": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,
