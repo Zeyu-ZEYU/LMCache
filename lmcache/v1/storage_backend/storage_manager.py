@@ -423,12 +423,14 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(
-                ks, objs,
-                transfer_spec=transfer_spec,
-                layer_id=layer_id,
-                num_layers=num_layers,
-            )
+            # Only pass layer_id/num_layers to backends that support it
+            # (RemoteBackend for head NIC routing). Other backends
+            # like LocalCPUBackend don't accept these kwargs.
+            put_kwargs: dict = {"transfer_spec": transfer_spec}
+            if layer_id is not None and hasattr(backend, "head_connection"):
+                put_kwargs["layer_id"] = layer_id
+                put_kwargs["num_layers"] = num_layers
+            backend.batched_submit_put_task(ks, objs, **put_kwargs)
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:

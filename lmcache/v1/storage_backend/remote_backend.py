@@ -83,10 +83,12 @@ class RemoteBackend(StorageBackendInterface):
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
-        # --- Head NIC splitting ---
+        # --- Head NIC splitting (lazy init to avoid port conflicts at startup) ---
         self.head_connection: Optional[RemoteConnector] = None
-        if config.enable_head_nic_split and config.head_nic_config_file:
-            self._init_head_nic_connector(config, metadata, loop, local_cpu_backend)
+        self._head_nic_enabled = (
+            config.enable_head_nic_split and config.head_nic_config_file
+        )
+        self._head_nic_init_args = (config, metadata, loop, local_cpu_backend)
 
         # NOTE: Health monitoring is now handled at the LMCacheEngine level
         # through HealthMonitor. RemoteBackend no longer manages its own
@@ -97,6 +99,15 @@ class RemoteBackend(StorageBackendInterface):
 
         self._get_blocking_failed_count = 0
         self._put_failed_count = 0
+
+    def _ensure_head_connection(self) -> Optional[RemoteConnector]:
+        """Lazy-init: create head NIC connector on first use."""
+        if self.head_connection is not None:
+            return self.head_connection
+        if not self._head_nic_enabled:
+            return None
+        self._init_head_nic_connector(*self._head_nic_init_args)
+        return self.head_connection
 
     def _init_head_nic_connector(
         self,
@@ -342,7 +353,14 @@ class RemoteBackend(StorageBackendInterface):
                 for memory_obj in memory_objs:
                     memory_obj.ref_count_down()
 
+            kv_put_start = time.perf_counter()
+
             def batched_done_callback(f: Future) -> None:
+                elapsed_ms = (time.perf_counter() - kv_put_start) * 1000
+                logger.info(
+                    "KV transfer: %d chunks, %.1f ms (layer=%s)",
+                    len(keys), elapsed_ms, layer_id,
+                )
                 self.batched_put_callback(f, list(keys))
                 # Invoke per-key callback for each key in the batch
                 if on_complete_callback is not None:
@@ -369,10 +387,11 @@ class RemoteBackend(StorageBackendInterface):
             if preferred_segment:
                 put_kwargs["preferred_segment"] = preferred_segment
 
-            # --- Head NIC routing ---
+            # --- Head NIC routing (lazy init) ---
             if (
-                self.head_connection is not None
+                self._head_nic_enabled
                 and layer_id is not None
+                and self._ensure_head_connection() is not None
             ):
                 num_chunks = len(keys)
                 head_idx = []
@@ -517,8 +536,8 @@ class RemoteBackend(StorageBackendInterface):
 
         t1 = time.perf_counter()
 
-        # --- Head NIC routing for retrieve ---
-        if self.head_connection is not None and keys:
+        # --- Head NIC routing for retrieve (lazy init) ---
+        if self._head_nic_enabled and keys and self._ensure_head_connection() is not None:
             layer_id = getattr(keys[0], "layer_id", None)
             if layer_id is not None:
                 num_chunks = len(keys)

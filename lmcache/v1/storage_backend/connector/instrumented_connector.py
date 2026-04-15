@@ -172,7 +172,8 @@ class InstrumentedRemoteConnector(RemoteConnector):
         return memory_objs
 
     async def batched_put(
-        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
+        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj],
+        **kwargs,
     ):
         total_size = sum(
             memory_obj.get_size()
@@ -181,7 +182,7 @@ class InstrumentedRemoteConnector(RemoteConnector):
         )
         begin = time.perf_counter()
         try:
-            await self._connector.batched_put(keys, memory_objs)
+            await self._connector.batched_put(keys, memory_objs, **kwargs)
         except Exception as e:
             logger.warning(f"batched put error: {e}")
         finally:
