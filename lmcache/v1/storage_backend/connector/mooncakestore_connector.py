@@ -491,11 +491,15 @@ class MooncakestoreConnector(RemoteConnector):
         self,
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
+        preferred_segment: Optional[str] = None,
     ):
         """
         Batched put with clear split by metadata mode.
         - save_chunk_meta False: use Mooncake's batch_put_from (zero-copy).
         - save_chunk_meta True: no batch API; fall back to sequential put_parts.
+
+        :param preferred_segment: If set, override the default replica_config
+            to RDMA WRITE directly to the specified segment (e.g., decode node).
         """
         if not keys:
             return
@@ -503,12 +507,15 @@ class MooncakestoreConnector(RemoteConnector):
         if self.save_chunk_meta:
             await self._batched_put_with_metadata(keys, memory_objs)
         else:
-            await self._batched_put_zero_copy(keys, memory_objs)
+            await self._batched_put_zero_copy(
+                keys, memory_objs, preferred_segment=preferred_segment
+            )
 
     async def _batched_put_zero_copy(
         self,
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
+        preferred_segment: Optional[str] = None,
     ) -> None:
         key_strs = [k.to_string() for k in keys]
         buffer_ptrs: list[int] = []
@@ -518,6 +525,16 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
+        # Use per-request preferred_segment if provided (e.g., target
+        # decode node for KV overlap), otherwise use the default config.
+        replica_cfg = self.replica_config
+        if preferred_segment:
+            from mooncake.mooncake_store_py import ReplicateConfig
+
+            replica_cfg = ReplicateConfig()
+            replica_cfg.replica_num = self.replica_config.replica_num
+            replica_cfg.preferred_segment = preferred_segment
+
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -525,7 +542,7 @@ class MooncakestoreConnector(RemoteConnector):
                     key_strs,
                     buffer_ptrs,
                     buffer_sizes,
-                    self.replica_config,
+                    replica_cfg,
                 ),
                 timeout=self.config.transfer_timeout,
             )

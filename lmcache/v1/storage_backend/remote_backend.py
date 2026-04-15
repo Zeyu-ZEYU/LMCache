@@ -303,8 +303,25 @@ class RemoteBackend(StorageBackendInterface):
                                 f"on_complete_callback failed for key {key}: {e}"
                             )
 
+            # Extract preferred_segment from transfer_spec for
+            # targeted RDMA WRITE (e.g., to decode node's segment).
+            # Only Mooncake connector supports preferred_segment.
+            preferred_segment = None
+            if transfer_spec is not None and hasattr(
+                transfer_spec, "receiver_rdma_host"
+            ):
+                preferred_segment = getattr(
+                    transfer_spec, "receiver_rdma_host", None
+                )
+
+            put_kwargs: dict = {}
+            if preferred_segment:
+                put_kwargs["preferred_segment"] = preferred_segment
+
             future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
+                self.connection.batched_put(
+                    keys, compressed_memory_objs, **put_kwargs
+                ),
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)

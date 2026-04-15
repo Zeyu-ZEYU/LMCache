@@ -722,11 +722,15 @@ class LMCacheEngine:
 
             next(mem_obj_generator)
 
+            transfer_spec = kwargs.get("transfer_spec", None)
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
                 self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
+                    keys[layer_id],
+                    memory_objs[layer_id],
+                    transfer_spec=transfer_spec,
+                    location=self.store_location,
                 )
 
             tot_time = time.perf_counter() - t_start

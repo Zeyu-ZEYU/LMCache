@@ -83,6 +83,7 @@ class DisaggSpec:
     receiver_host: str
     receiver_init_port: int
     receiver_alloc_port: int
+    receiver_rdma_host: Optional[str] = None  # Mooncake RDMA hostname
     is_last_prefill: bool = False
     num_transferred_tokens: int = 0
 
@@ -1059,8 +1060,6 @@ class LMCacheConnectorV1Impl:
                     request.req_id,
                 )
 
-                # TODO (Jiayi): need to make layerwise storing
-                # compatible with disagg spec
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -1069,6 +1068,7 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    transfer_spec=request.disagg_spec,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -1382,6 +1382,9 @@ class LMCacheConnectorV1Impl:
                 receiver_host=req_disagg_spec["receiver_host"],
                 receiver_init_port=req_disagg_spec["receiver_init_port"],
                 receiver_alloc_port=req_disagg_spec["receiver_alloc_port"],
+                receiver_rdma_host=req_disagg_spec.get(
+                    "receiver_rdma_host"
+                ),
             )
 
             tmp_disagg_tracker[request.request_id] = disagg_spec
