@@ -137,6 +137,12 @@ class RemoteBackend(StorageBackendInterface):
                 head_config,
                 metadata,
             )
+            # Ensure head connector uses zero-copy (not put_parts).
+            # copy.copy of metaclass config may not propagate extra_config
+            # correctly, causing save_chunk_meta to default to wrong value.
+            inner = getattr(self.head_connection, "_connector", None)
+            if inner and hasattr(inner, "save_chunk_meta"):
+                inner.save_chunk_meta = False
             logger.info(
                 "Head NIC connector initialized: url=%s device=%s",
                 head_url,
