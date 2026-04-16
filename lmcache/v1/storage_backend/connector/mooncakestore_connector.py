@@ -187,8 +187,19 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to determine NUMA mapping before Mooncake setup: {e}"
                 )
 
+            # Append unique port suffix to local_hostname to make rpc_meta
+            # key unique per worker. IPv6 requires [addr]:port format.
+            import socket as _socket
+            host = self.config.local_hostname
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+                _s.bind(("", 0))
+                unique_port = _s.getsockname()[1]
+            if ":" in host and not host.startswith("["):
+                unique_hostname = f"[{host}]:{unique_port}"
+            else:
+                unique_hostname = f"{host}:{unique_port}"
             self.store.setup(
-                self.config.local_hostname,
+                unique_hostname,
                 self.config.metadata_server,
                 self.config.global_segment_size,
                 self.config.local_buffer_size,
@@ -196,7 +207,10 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.device_name,
                 self.config.master_server_address,
             )
-            logger.info("Mooncake store setup completed successfully")
+            logger.info(
+                "Mooncake store setup completed: hostname=%s",
+                unique_hostname,
+            )
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
