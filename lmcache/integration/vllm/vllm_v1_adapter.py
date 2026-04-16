@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -1074,6 +1075,12 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
+            # Record KV start time (first layer for this request)
+            if not hasattr(self, "_kv_start_times"):
+                self._kv_start_times: dict[str, float] = {}
+            if request.req_id not in self._kv_start_times:
+                self._kv_start_times[request.req_id] = time.perf_counter()
+
             next(layerwise_storer)
 
     @_lmcache_nvtx_annotate
@@ -1096,6 +1103,7 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            t_prefill_end = time.perf_counter()
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
@@ -1104,7 +1112,24 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            t_kv_end = time.perf_counter()
+            # Record per-request timing for request_finished()
+            if not hasattr(self, "_kv_timing"):
+                self._kv_timing: dict[str, dict] = {}
+            kv_starts = getattr(self, "_kv_start_times", {})
+            for request in connector_metadata.requests:
+                t_kv_start = kv_starts.pop(request.req_id, t_prefill_end)
+                prefill_ms = (t_prefill_end - t_kv_start) * 1000
+                kv_total_ms = (t_kv_end - t_kv_start) * 1000
+                kv_exposed_ms = max(0, (t_kv_end - t_prefill_end) * 1000)
+                logger.info(
+                    "[METRICS req=%s] prefill=%.1fms kv_total=%.1fms "
+                    "kv_exposed=%.1fms",
+                    request.req_id, prefill_ms, kv_total_ms, kv_exposed_ms,
+                )
             return
+
+        t_prefill_end = time.perf_counter()
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -1181,6 +1206,14 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+            )
+
+            t_kv_end = time.perf_counter()
+            kv_total_ms = (t_kv_end - t_prefill_end) * 1000
+            logger.info(
+                "[METRICS req=%s] prefill=N/A kv_total=%.1fms "
+                "kv_exposed=%.1fms (non-layerwise)",
+                request.req_id, kv_total_ms, kv_total_ms,
             )
 
             # Update skip_leading_tokens only on last rank to ensure
