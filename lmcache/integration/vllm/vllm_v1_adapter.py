@@ -1208,6 +1208,13 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
+        # Phase 1: submit all stores. Don't block per-request — `store()`
+        # already submits async via remote_backend, so serializing the
+        # wait inside this loop would stall subsequent requests behind
+        # each one's RDMA. Collect req_ids that actually got Puts
+        # submitted; Phase 2 then awaits them all (in parallel in the
+        # asyncio loop) and writes metrics.
+        submitted_req_ids: list[str] = []
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
@@ -1279,20 +1286,28 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
-            # `store()` returns after submitting RDMA Puts; it does NOT
-            # wait for actual completion. Block on the remote backend's
-            # Put tracker to get the real first-start / last-end wall
-            # times before writing the metrics line.
-            remote_backend = self._get_remote_backend()
-            prefill_starts = getattr(self, "_prefill_start_times", {})
-            t_prefill_start = prefill_starts.pop(
-                request.req_id, t_prefill_end
-            )
+            submitted_req_ids.append(request.req_id)
+
+            # Update skip_leading_tokens only on last rank to ensure
+            # each PP stage stores its own KV cache
+            if get_pp_group().is_last_rank:
+                # NOTE(Jiayi): We assume all tokens are saved
+                save_spec.skip_leading_tokens = len(token_ids)
+                if request.disagg_spec:
+                    request.disagg_spec.num_transferred_tokens = len(token_ids)
+
+        # Phase 2: for every request whose Puts were submitted, wait for
+        # real RDMA completion and emit the metrics line with true
+        # first-start / last-end timestamps.
+        remote_backend = self._get_remote_backend()
+        prefill_starts = getattr(self, "_prefill_start_times", {})
+        for req_id in submitted_req_ids:
+            t_prefill_start = prefill_starts.pop(req_id, t_prefill_end)
             t_kv_start: Optional[float] = None
             t_kv_end_req: Optional[float] = None
             if remote_backend is not None:
                 t_kv_start, t_kv_end_req = remote_backend.wait_put_done(
-                    request.req_id
+                    req_id
                 )
             if t_kv_start is None:
                 t_kv_start = t_prefill_end
@@ -1304,17 +1319,9 @@ class LMCacheConnectorV1Impl:
                 0.0, (t_kv_end_req - t_prefill_end) * 1000
             )
             self._write_metric_line(
-                request.req_id, prefill_ms, kv_total_ms,
+                req_id, prefill_ms, kv_total_ms,
                 kv_exposed_ms, "non_layerwise",
             )
-
-            # Update skip_leading_tokens only on last rank to ensure
-            # each PP stage stores its own KV cache
-            if get_pp_group().is_last_rank:
-                # NOTE(Jiayi): We assume all tokens are saved
-                save_spec.skip_leading_tokens = len(token_ids)
-                if request.disagg_spec:
-                    request.disagg_spec.num_transferred_tokens = len(token_ids)
 
     @_lmcache_nvtx_annotate
     def get_finished(
