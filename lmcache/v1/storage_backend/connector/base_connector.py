@@ -50,18 +50,39 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             config: the lmcache engine config
             metadata: the lmcache engine metadata
         """
-        # TODO(chunxiaozheng): support layerwise here
         assert metadata is not None
+        self.use_layerwise: bool = config.use_layerwise
+        # In layerwise mode each chunk is a per-layer slice (one mooncake
+        # Put per layer). We want save_chunk_meta=False so we use the fast
+        # zero-copy `batch_put_from` / `batch_get_into` path and respect
+        # `preferred_segment` (direct RDMA WRITE to decode). The default is
+        # still True for backward compatibility when the user doesn't set it.
         self.save_chunk_meta: bool = (
             config.extra_config is None
             or config.extra_config.get("save_chunk_meta", True)
-            or config.use_layerwise
         )
-        self.meta_shapes: list[torch.Size] = metadata.get_shapes()
         self.meta_dtypes: list[torch.dtype] = metadata.get_dtypes()
-        self.meta_fmt: MemoryFormat = (
-            MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
-        )
+        if self.use_layerwise:
+            # Per-layer chunk shape, matches what the layerwise gpu_connector
+            # produces: [num_tokens, kv_size, hidden_dim]. kv_shape layout is
+            # [num_layers, kv_size, num_tokens, num_heads, head_size].
+            kv_shape = metadata.kv_shape
+            num_tokens = kv_shape[2]
+            kv_size = kv_shape[1]
+            hidden_dim = kv_shape[3] * kv_shape[4]
+            self.meta_shapes: list[torch.Size] = [
+                torch.Size([num_tokens, kv_size, hidden_dim])
+            ]
+            self.meta_fmt: MemoryFormat = (
+                MemoryFormat.KV_MLA_FMT if metadata.use_mla
+                else MemoryFormat.KV_T2D
+            )
+        else:
+            self.meta_shapes = metadata.get_shapes()
+            self.meta_fmt = (
+                MemoryFormat.KV_MLA_FMT if metadata.use_mla
+                else MemoryFormat.KV_2LTD
+            )
         self.full_chunk_size_bytes: int = get_size_bytes(
             self.meta_shapes, self.meta_dtypes
         )
@@ -106,8 +127,12 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             return memory_obj
 
         # NOTE: for unfull chunk, we have no way to verify
+        # Token dim location depends on the memory format:
+        # - Full-layer (KV_2LTD): shape = [2, num_layers, num_tokens, hidden] → dim 2
+        # - Layerwise (KV_T2D per gpu_connector): shape = [num_tokens, 2, hidden] → dim 0
+        token_dim = 0 if self.use_layerwise else 2
         shape_list = list(memory_obj.meta.shape)
-        shape_list[2] = bytes_read // self.single_token_size
+        shape_list[token_dim] = bytes_read // self.single_token_size
         actual_shape = torch.Size(shape_list)
         memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
         memory_obj.meta.shape = actual_shape
