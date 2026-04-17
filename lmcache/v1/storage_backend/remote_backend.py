@@ -41,6 +41,20 @@ class RemoteBackend(StorageBackendInterface):
         self.put_tasks: Set[CacheEngineKey] = set()
         self.lock = threading.Lock()
 
+        # Per-request Put-completion tracking for accurate KV transfer
+        # timestamps. `batched_submit_put_task` increments the pending
+        # counter before submitting the asyncio future and decrements it
+        # from the future's done callback (which fires when the actual
+        # RDMA Put completes). `wait_put_done` is called from
+        # vllm_v1_adapter.wait_for_save to block until all Puts for a given
+        # request have truly finished, and to recover the real first-start
+        # and last-end wall-clock timestamps.
+        self._put_track_lock = threading.Lock()
+        self._put_pending_per_req: dict[str, int] = {}
+        self._put_done_events: dict[str, threading.Event] = {}
+        self._put_first_start_ts: dict[str, float] = {}
+        self._put_last_end_ts: dict[str, float] = {}
+
         assert config.remote_url is not None
 
         self.remote_url = config.remote_url
@@ -99,6 +113,66 @@ class RemoteBackend(StorageBackendInterface):
 
         self._get_blocking_failed_count = 0
         self._put_failed_count = 0
+
+    # ------------------------------------------------------------------
+    # Per-request Put-completion tracking
+    # ------------------------------------------------------------------
+
+    def _track_put_submit(self, req_id: Optional[str], future: Future) -> None:
+        """Record that a Put future has been submitted for ``req_id``.
+
+        On the future's done-callback (fires when the actual RDMA transfer
+        finishes), decrement the pending counter and remember the wall
+        time. `wait_put_done` later reads ``first_start_ts`` and
+        ``last_end_ts`` to report the real KV-transfer window.
+        """
+        if req_id is None:
+            return
+
+        def _on_done(_f: Future) -> None:
+            with self._put_track_lock:
+                self._put_pending_per_req[req_id] = (
+                    self._put_pending_per_req.get(req_id, 1) - 1
+                )
+                self._put_last_end_ts[req_id] = time.perf_counter()
+                if self._put_pending_per_req[req_id] <= 0:
+                    ev = self._put_done_events.get(req_id)
+                    if ev is not None:
+                        ev.set()
+
+        with self._put_track_lock:
+            if req_id not in self._put_done_events:
+                self._put_done_events[req_id] = threading.Event()
+                self._put_first_start_ts[req_id] = time.perf_counter()
+                self._put_pending_per_req[req_id] = 0
+            self._put_pending_per_req[req_id] += 1
+            # New submit means not-yet-done.
+            self._put_done_events[req_id].clear()
+
+        future.add_done_callback(_on_done)
+
+    def wait_put_done(
+        self, req_id: str, timeout: float = 30.0
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Block until all tracked Puts for ``req_id`` have completed.
+
+        Returns ``(first_start_ts, last_end_ts)`` as perf_counter times,
+        or ``(None, None)`` if no Puts were tracked for this request.
+
+        The per-request tracking state is popped (freed) after return so
+        subsequent calls with the same req_id return ``(None, None)``.
+        """
+        with self._put_track_lock:
+            event = self._put_done_events.get(req_id)
+        if event is None:
+            return None, None
+        event.wait(timeout)
+        with self._put_track_lock:
+            start_ts = self._put_first_start_ts.pop(req_id, None)
+            end_ts = self._put_last_end_ts.pop(req_id, None)
+            self._put_pending_per_req.pop(req_id, None)
+            self._put_done_events.pop(req_id, None)
+        return start_ts, end_ts
 
     def _ensure_head_connection(self) -> Optional[RemoteConnector]:
         """Lazy-init: create head NIC connector on first use."""
@@ -327,6 +401,7 @@ class RemoteBackend(StorageBackendInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
         layer_id: Optional[int] = None,
         num_layers: int = 0,
+        req_id: Optional[str] = None,
     ) -> None:
         """
         Submit batched put tasks to store KV caches to remote storage.
@@ -335,6 +410,9 @@ class RemoteBackend(StorageBackendInterface):
             after that key's write completes (not once per batch).
         :param layer_id: Layer index for head NIC routing (optional).
         :param num_layers: Total layers for head NIC routing.
+        :param req_id: vLLM request id; when set, each submitted Put future
+            is tracked so that ``wait_put_done(req_id)`` can later report
+            the real RDMA first-start / last-end timestamps.
         """
         if self.connection is None:
             logger.warning(
@@ -418,6 +496,7 @@ class RemoteBackend(StorageBackendInterface):
                         self.head_connection.batched_put(h_keys, h_objs),
                         self.loop,
                     )
+                    self._track_put_submit(req_id, hf)
                     hf.add_done_callback(batched_done_callback)
                 if tail_idx:
                     t_keys = [keys[i] for i in tail_idx]
@@ -428,6 +507,7 @@ class RemoteBackend(StorageBackendInterface):
                         ),
                         self.loop,
                     )
+                    self._track_put_submit(req_id, tf)
                     tf.add_done_callback(batched_done_callback)
             else:
                 # Default: all chunks via tail (main connection)
@@ -437,6 +517,7 @@ class RemoteBackend(StorageBackendInterface):
                     ),
                     self.loop,
                 )
+                self._track_put_submit(req_id, future)
                 future.add_done_callback(batched_done_callback)
         else:
             for key, memory_obj in zip(keys, memory_objs, strict=False):

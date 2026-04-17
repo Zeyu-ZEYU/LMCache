@@ -541,6 +541,7 @@ class LMCacheEngine:
                 memory_objs,
                 transfer_spec=transfer_spec,
                 location=self.store_location,
+                req_id=req_id,
             )
 
         self.stats_monitor.on_store_finished(
@@ -733,6 +734,7 @@ class LMCacheEngine:
                     location=self.store_location,
                     layer_id=layer_id,
                     num_layers=self.num_layers,
+                    req_id=req_id,
                 )
 
             tot_time = time.perf_counter() - t_start

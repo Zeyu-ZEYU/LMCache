@@ -736,6 +736,20 @@ class LMCacheConnectorV1Impl:
     # docker exec.
     _METRICS_FILE = "/home/zeyu/lmcache_metrics.jsonl"
 
+    def _get_remote_backend(self):
+        """Return the RemoteBackend instance, or None if not present.
+
+        Identified by the presence of a ``wait_put_done`` method so the
+        adapter doesn't hard-code the backend class name.
+        """
+        sm = getattr(self.lmcache_engine, "storage_manager", None)
+        if sm is None:
+            return None
+        for backend in sm.storage_backends.values():
+            if hasattr(backend, "wait_put_done"):
+                return backend
+        return None
+
     def _write_metric_line(
         self, req_id: str, prefill_ms: float, kv_total_ms: float,
         kv_exposed_ms: float, mode: str,
@@ -1118,11 +1132,10 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            # Record KV start time (first layer for this request)
-            if not hasattr(self, "_kv_start_times"):
-                self._kv_start_times: dict[str, float] = {}
-            if request.req_id not in self._kv_start_times:
-                self._kv_start_times[request.req_id] = time.perf_counter()
+            # NOTE: KV start time (first layer RDMA actually begins) is
+            # tracked inside RemoteBackend via _track_put_submit. Don't
+            # record a proxy start here — it would be earlier than the
+            # real RDMA submission.
 
             next(layerwise_storer)
 
@@ -1155,17 +1168,33 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
-            t_kv_end = time.perf_counter()
-            kv_starts = getattr(self, "_kv_start_times", {})
+
+            # After all generators flushed, RDMA Puts have been SUBMITTED
+            # but not necessarily completed. Block per-request on the
+            # remote backend's Put-completion tracker so we use true
+            # wall-clock RDMA first-start and last-end timestamps for
+            # kv_total / kv_exposed.
+            remote_backend = self._get_remote_backend()
             prefill_starts = getattr(self, "_prefill_start_times", {})
             for request in connector_metadata.requests:
                 t_prefill_start = prefill_starts.pop(
                     request.req_id, t_prefill_end
                 )
-                t_kv_start = kv_starts.pop(request.req_id, t_prefill_end)
+                t_kv_start: Optional[float] = None
+                t_kv_end_req: Optional[float] = None
+                if remote_backend is not None:
+                    t_kv_start, t_kv_end_req = remote_backend.wait_put_done(
+                        request.req_id
+                    )
+                if t_kv_start is None:
+                    t_kv_start = t_prefill_end
+                if t_kv_end_req is None:
+                    t_kv_end_req = time.perf_counter()
                 prefill_ms = (t_prefill_end - t_prefill_start) * 1000
-                kv_total_ms = (t_kv_end - t_kv_start) * 1000
-                kv_exposed_ms = max(0, (t_kv_end - t_prefill_end) * 1000)
+                kv_total_ms = (t_kv_end_req - t_kv_start) * 1000
+                kv_exposed_ms = max(
+                    0.0, (t_kv_end_req - t_prefill_end) * 1000
+                )
                 self._write_metric_line(
                     request.req_id, prefill_ms, kv_total_ms,
                     kv_exposed_ms, "layerwise",
@@ -1240,7 +1269,6 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
-            t_store_start = time.perf_counter()
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1251,17 +1279,33 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
-            t_kv_end = time.perf_counter()
-
+            # `store()` returns after submitting RDMA Puts; it does NOT
+            # wait for actual completion. Block on the remote backend's
+            # Put tracker to get the real first-start / last-end wall
+            # times before writing the metrics line.
+            remote_backend = self._get_remote_backend()
             prefill_starts = getattr(self, "_prefill_start_times", {})
             t_prefill_start = prefill_starts.pop(
                 request.req_id, t_prefill_end
             )
+            t_kv_start: Optional[float] = None
+            t_kv_end_req: Optional[float] = None
+            if remote_backend is not None:
+                t_kv_start, t_kv_end_req = remote_backend.wait_put_done(
+                    request.req_id
+                )
+            if t_kv_start is None:
+                t_kv_start = t_prefill_end
+            if t_kv_end_req is None:
+                t_kv_end_req = time.perf_counter()
             prefill_ms = (t_prefill_end - t_prefill_start) * 1000
-            kv_total_ms = (t_kv_end - t_store_start) * 1000
+            kv_total_ms = (t_kv_end_req - t_kv_start) * 1000
+            kv_exposed_ms = max(
+                0.0, (t_kv_end_req - t_prefill_end) * 1000
+            )
             self._write_metric_line(
                 request.req_id, prefill_ms, kv_total_ms,
-                kv_total_ms, "non_layerwise",
+                kv_exposed_ms, "non_layerwise",
             )
 
             # Update skip_leading_tokens only on last rank to ensure
