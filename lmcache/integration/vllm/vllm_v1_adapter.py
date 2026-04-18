@@ -798,7 +798,22 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
-        t_prefill_start = time.perf_counter()
+        # Prefill-timing instrumentation: producer side only.
+        # We drain the CUDA stream first so t_prefill_start reflects the
+        # moment the GPU is idle and about to begin this forward pass,
+        # not the host-time when start_load_kv was entered (otherwise
+        # tail kernels of the previous iteration's sampler etc. leak
+        # into prefill_time as a shifted zero).
+        # Decode (kv_consumer) skips both the sync and the record: we
+        # don't use prefill_start there, and syncing would stall the
+        # decode forward pipeline and perturb client-side ITL.
+        is_prefill_producer = self.kv_role == "kv_producer"
+        t_prefill_start: Optional[float] = None
+        if is_prefill_producer:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_prefill_start = time.perf_counter()
+
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -811,9 +826,9 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
-        # Record prefill start time per request (first chunk only via setdefault).
-        # Used in wait_for_save() to compute prefill_time for the metrics log.
-        if self.kv_role == "kv_producer":
+        # Record prefill start time per request (first chunk only via
+        # setdefault). Used in wait_for_save() to compute prefill_time.
+        if is_prefill_producer:
             if not hasattr(self, "_prefill_start_times"):
                 self._prefill_start_times: dict[str, float] = {}
             for request in metadata.requests:
@@ -1164,6 +1179,11 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            # Forward has returned on the host but its last kernels may
+            # still be running on the GPU. Sync so t_prefill_end reflects
+            # actual end-of-compute, not last-kernel-launched.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             t_prefill_end = time.perf_counter()
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
@@ -1209,6 +1229,11 @@ class LMCacheConnectorV1Impl:
                 )
             return
 
+        # Same rationale as the layerwise branch above: sync to capture
+        # the true GPU-end-of-forward, not host-time after the last
+        # kernel was merely launched.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t_prefill_end = time.perf_counter()
 
         assert len(self.kv_caches) > 0
