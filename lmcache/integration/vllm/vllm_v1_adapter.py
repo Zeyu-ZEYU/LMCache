@@ -1132,10 +1132,15 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            # NOTE: KV start time (first layer RDMA actually begins) is
-            # tracked inside RemoteBackend via _track_put_submit. Don't
-            # record a proxy start here — it would be earlier than the
-            # real RDMA submission.
+            # Record the moment the KV pipeline first starts for this
+            # request. This is *before* any RDMA submit — it covers the
+            # first GPU→CPU layer offload, so the reported `kv_total`
+            # matches the user-visible definition "KV 传输开始到 KV 传输结束".
+            if not hasattr(self, "_kv_pipeline_start"):
+                self._kv_pipeline_start: dict[str, float] = {}
+            self._kv_pipeline_start.setdefault(
+                request.req_id, time.perf_counter()
+            )
 
             next(layerwise_storer)
 
@@ -1171,23 +1176,26 @@ class LMCacheConnectorV1Impl:
 
             # After all generators flushed, RDMA Puts have been SUBMITTED
             # but not necessarily completed. Block per-request on the
-            # remote backend's Put-completion tracker so we use true
-            # wall-clock RDMA first-start and last-end timestamps for
-            # kv_total / kv_exposed.
+            # remote backend's Put-completion tracker so we use the true
+            # wall-clock "last-RDMA-done" for kv_total / kv_exposed.
+            # t_kv_start here is the FIRST save_kv_layer call (captured in
+            # save_kv_layer above) so kv_total spans the whole pipeline
+            # from "first KV begins to move" to "last KV done".
             remote_backend = self._get_remote_backend()
             prefill_starts = getattr(self, "_prefill_start_times", {})
+            kv_pipeline_starts = getattr(self, "_kv_pipeline_start", {})
             for request in connector_metadata.requests:
                 t_prefill_start = prefill_starts.pop(
                     request.req_id, t_prefill_end
                 )
-                t_kv_start: Optional[float] = None
+                t_kv_start = kv_pipeline_starts.pop(
+                    request.req_id, t_prefill_end
+                )
                 t_kv_end_req: Optional[float] = None
                 if remote_backend is not None:
-                    t_kv_start, t_kv_end_req = remote_backend.wait_put_done(
+                    _, t_kv_end_req = remote_backend.wait_put_done(
                         request.req_id
                     )
-                if t_kv_start is None:
-                    t_kv_start = t_prefill_end
                 if t_kv_end_req is None:
                     t_kv_end_req = time.perf_counter()
                 prefill_ms = (t_prefill_end - t_prefill_start) * 1000
@@ -1297,30 +1305,29 @@ class LMCacheConnectorV1Impl:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
 
         # Phase 2: for every request whose Puts were submitted, wait for
-        # real RDMA completion and emit the metrics line with true
-        # first-start / last-end timestamps.
+        # real RDMA completion and emit the metrics line.
+        # In non-overlap mode the KV pipeline (GPU→CPU offload + RDMA) all
+        # happens inside wait_for_save, so kv_total and kv_exposed both
+        # span `t_prefill_end → last-RDMA-done` — they are definitionally
+        # equal, which matches the user-visible expectation.
         remote_backend = self._get_remote_backend()
         prefill_starts = getattr(self, "_prefill_start_times", {})
         for req_id in submitted_req_ids:
             t_prefill_start = prefill_starts.pop(req_id, t_prefill_end)
-            t_kv_start: Optional[float] = None
             t_kv_end_req: Optional[float] = None
             if remote_backend is not None:
-                t_kv_start, t_kv_end_req = remote_backend.wait_put_done(
-                    req_id
-                )
-            if t_kv_start is None:
-                t_kv_start = t_prefill_end
+                _, t_kv_end_req = remote_backend.wait_put_done(req_id)
             if t_kv_end_req is None:
                 t_kv_end_req = time.perf_counter()
             prefill_ms = (t_prefill_end - t_prefill_start) * 1000
-            kv_total_ms = (t_kv_end_req - t_kv_start) * 1000
-            kv_exposed_ms = max(
+            kv_window_ms = max(
                 0.0, (t_kv_end_req - t_prefill_end) * 1000
             )
             self._write_metric_line(
-                req_id, prefill_ms, kv_total_ms,
-                kv_exposed_ms, "non_layerwise",
+                req_id, prefill_ms,
+                kv_window_ms,    # kv_total = whole offload+RDMA window
+                kv_window_ms,    # kv_exposed = same (non-overlap)
+                "non_layerwise",
             )
 
     @_lmcache_nvtx_annotate
