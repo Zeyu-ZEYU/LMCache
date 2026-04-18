@@ -41,19 +41,35 @@ class RemoteBackend(StorageBackendInterface):
         self.put_tasks: Set[CacheEngineKey] = set()
         self.lock = threading.Lock()
 
-        # Per-request Put-completion tracking for accurate KV transfer
-        # timestamps. `batched_submit_put_task` increments the pending
-        # counter before submitting the asyncio future and decrements it
-        # from the future's done callback (which fires when the actual
-        # RDMA Put completes). `wait_put_done` is called from
-        # vllm_v1_adapter.wait_for_save to block until all Puts for a given
-        # request have truly finished, and to recover the real first-start
-        # and last-end wall-clock timestamps.
+        # Per-request Put / Get completion tracking for accurate KV
+        # transfer timestamps. Timestamps are recorded as wall-clock
+        # epoch time (time.time()) — not perf_counter — so the benchmark
+        # can join producer (prefill) and consumer (decode) traces
+        # across nodes.
+        #
+        # Put side (producer): `batched_submit_put_task` submits an
+        # asyncio future for Mooncake's RDMA WRITE; the future's done
+        # callback fires when the Put actually completes (= CQE on the
+        # sender side, i.e. data is already in the target segment,
+        # whether local or remote). `wait_put_done` lets wait_for_save
+        # block until all Puts for a request have finished and recover
+        # the real first-submit and last-complete wall times.
+        #
+        # Get side (consumer): batched_get_non_blocking returns futures;
+        # `_track_get_submit` wraps them so we know when each request's
+        # Mooncake Gets are done on the CPU side. `wait_get_done` lets
+        # the consumer adapter read last-end time after forward.
         self._put_track_lock = threading.Lock()
         self._put_pending_per_req: dict[str, int] = {}
         self._put_done_events: dict[str, threading.Event] = {}
         self._put_first_start_ts: dict[str, float] = {}
         self._put_last_end_ts: dict[str, float] = {}
+
+        self._get_track_lock = threading.Lock()
+        self._get_pending_per_req: dict[str, int] = {}
+        self._get_done_events: dict[str, threading.Event] = {}
+        self._get_first_start_ts: dict[str, float] = {}
+        self._get_last_end_ts: dict[str, float] = {}
 
         assert config.remote_url is not None
 
@@ -121,10 +137,11 @@ class RemoteBackend(StorageBackendInterface):
     def _track_put_submit(self, req_id: Optional[str], future: Future) -> None:
         """Record that a Put future has been submitted for ``req_id``.
 
-        On the future's done-callback (fires when the actual RDMA transfer
-        finishes), decrement the pending counter and remember the wall
-        time. `wait_put_done` later reads ``first_start_ts`` and
-        ``last_end_ts`` to report the real KV-transfer window.
+        The future's done callback fires when Mooncake's batch_put_from
+        returns — i.e., the data is in the target segment (RDMA WRITE
+        CQE for cross-node, or local buffer for same-node). We log that
+        as the wall-clock end time. `wait_put_done` later reports the
+        first-submit and last-complete timestamps.
         """
         if req_id is None:
             return
@@ -134,7 +151,7 @@ class RemoteBackend(StorageBackendInterface):
                 self._put_pending_per_req[req_id] = (
                     self._put_pending_per_req.get(req_id, 1) - 1
                 )
-                self._put_last_end_ts[req_id] = time.perf_counter()
+                self._put_last_end_ts[req_id] = time.time()
                 if self._put_pending_per_req[req_id] <= 0:
                     ev = self._put_done_events.get(req_id)
                     if ev is not None:
@@ -143,7 +160,7 @@ class RemoteBackend(StorageBackendInterface):
         with self._put_track_lock:
             if req_id not in self._put_done_events:
                 self._put_done_events[req_id] = threading.Event()
-                self._put_first_start_ts[req_id] = time.perf_counter()
+                self._put_first_start_ts[req_id] = time.time()
                 self._put_pending_per_req[req_id] = 0
             self._put_pending_per_req[req_id] += 1
             # New submit means not-yet-done.
@@ -156,11 +173,9 @@ class RemoteBackend(StorageBackendInterface):
     ) -> tuple[Optional[float], Optional[float]]:
         """Block until all tracked Puts for ``req_id`` have completed.
 
-        Returns ``(first_start_ts, last_end_ts)`` as perf_counter times,
-        or ``(None, None)`` if no Puts were tracked for this request.
-
-        The per-request tracking state is popped (freed) after return so
-        subsequent calls with the same req_id return ``(None, None)``.
+        Returns ``(first_start_ts, last_end_ts)`` as wall-clock epoch
+        seconds (time.time()), or ``(None, None)`` if no Puts were
+        tracked for this request. State is popped after return.
         """
         with self._put_track_lock:
             event = self._put_done_events.get(req_id)
@@ -172,6 +187,54 @@ class RemoteBackend(StorageBackendInterface):
             end_ts = self._put_last_end_ts.pop(req_id, None)
             self._put_pending_per_req.pop(req_id, None)
             self._put_done_events.pop(req_id, None)
+        return start_ts, end_ts
+
+    def _track_get_submit(self, req_id: Optional[str], future: Future) -> None:
+        """Consumer-side symmetrical tracker for Get futures.
+
+        The future completes when Mooncake's batched_get has filled the
+        CPU-side MemoryObj for one layer / one chunk-batch. We record
+        first-submit and last-complete wall times; the consumer adapter
+        can then assemble the JSONL line for this request.
+        """
+        if req_id is None:
+            return
+
+        def _on_done(_f: Future) -> None:
+            with self._get_track_lock:
+                self._get_pending_per_req[req_id] = (
+                    self._get_pending_per_req.get(req_id, 1) - 1
+                )
+                self._get_last_end_ts[req_id] = time.time()
+                if self._get_pending_per_req[req_id] <= 0:
+                    ev = self._get_done_events.get(req_id)
+                    if ev is not None:
+                        ev.set()
+
+        with self._get_track_lock:
+            if req_id not in self._get_done_events:
+                self._get_done_events[req_id] = threading.Event()
+                self._get_first_start_ts[req_id] = time.time()
+                self._get_pending_per_req[req_id] = 0
+            self._get_pending_per_req[req_id] += 1
+            self._get_done_events[req_id].clear()
+
+        future.add_done_callback(_on_done)
+
+    def wait_get_done(
+        self, req_id: str, timeout: float = 30.0
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Symmetric to wait_put_done for consumer Gets."""
+        with self._get_track_lock:
+            event = self._get_done_events.get(req_id)
+        if event is None:
+            return None, None
+        event.wait(timeout)
+        with self._get_track_lock:
+            start_ts = self._get_first_start_ts.pop(req_id, None)
+            end_ts = self._get_last_end_ts.pop(req_id, None)
+            self._get_pending_per_req.pop(req_id, None)
+            self._get_done_events.pop(req_id, None)
         return start_ts, end_ts
 
     def _ensure_head_connection(self) -> Optional[RemoteConnector]:

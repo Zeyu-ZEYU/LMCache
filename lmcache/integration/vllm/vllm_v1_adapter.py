@@ -731,10 +731,13 @@ class LMCacheConnectorV1Impl:
     # Worker side APIs
     ####################
 
-    # Written at `/home/zeyu/...` so the file lives on the host-visible XFS
-    # mount and benchmark.py can collect it via plain `ssh cat` without
-    # docker exec.
-    _METRICS_FILE = "/home/zeyu/lmcache_metrics.jsonl"
+    # Written at `/home/zeyu/...` so the file lives on the host-visible
+    # XFS mount and benchmark.py can collect it via plain `ssh cat`
+    # without docker exec. Producer and consumer use separate files
+    # since on any given node one worker process only plays one role
+    # (prefill or decode), but the benchmark collects from both.
+    _METRICS_FILE_PRODUCER = "/home/zeyu/lmcache_metrics_producer.jsonl"
+    _METRICS_FILE_CONSUMER = "/home/zeyu/lmcache_metrics_consumer.jsonl"
 
     def _get_remote_backend(self):
         """Return the RemoteBackend instance, or None if not present.
@@ -750,30 +753,57 @@ class LMCacheConnectorV1Impl:
                 return backend
         return None
 
-    def _write_metric_line(
-        self, req_id: str, prefill_ms: float, kv_total_ms: float,
-        kv_exposed_ms: float, mode: str,
+    def _write_producer_metric(
+        self, req_id: str, mode: str,
+        t_prefill_start: float,
+        t_prefill_end: float,
+        t_kv_start: float,
+        t_kv_mnck_in_end: float,
     ) -> None:
-        """Append one request's timing to a local JSONL file.
+        """Append one prefill-side request record to producer JSONL.
 
-        Worker writes directly; benchmark.py collects via SSH after a run.
-        Bypasses Ray log forwarding (which drops most lines) and the Ray DP
-        cross-actor boundary that blocks returning data from worker to
-        scheduler's request_finished().
+        All four timestamps are wall-clock epoch seconds (time.time())
+        so the benchmark can cross-join with decode-side records.
         """
         try:
             line = json.dumps({
                 "req_id": req_id,
-                "prefill_ms": prefill_ms,
-                "kv_total_ms": kv_total_ms,
-                "kv_exposed_ms": kv_exposed_ms,
                 "mode": mode,
+                "t_prefill_start": t_prefill_start,
+                "t_prefill_end": t_prefill_end,
+                "t_kv_start": t_kv_start,
+                "t_kv_mnck_in_end": t_kv_mnck_in_end,
                 "ts": time.time(),
             })
-            with open(self._METRICS_FILE, "a") as f:
+            with open(self._METRICS_FILE_PRODUCER, "a") as f:
                 f.write(line + "\n")
         except Exception as e:
-            logger.debug("Failed to write metrics JSONL: %s", e)
+            logger.debug("Failed to write producer metrics JSONL: %s", e)
+
+    def _write_consumer_metric(
+        self, req_id: str, mode: str,
+        t_kv_mnck_out_start: float,
+        t_kv_end: float,
+    ) -> None:
+        """Append one decode-side request record to consumer JSONL.
+
+        Both timestamps are wall-clock epoch seconds (time.time()).
+        t_kv_end is captured AFTER cuda.synchronize() so it reflects
+        the moment KV is resident in GPU paged buffers (CPU→GPU memcpy
+        has completed).
+        """
+        try:
+            line = json.dumps({
+                "req_id": req_id,
+                "mode": mode,
+                "t_kv_mnck_out_start": t_kv_mnck_out_start,
+                "t_kv_end": t_kv_end,
+                "ts": time.time(),
+            })
+            with open(self._METRICS_FILE_CONSUMER, "a") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            logger.debug("Failed to write consumer metrics JSONL: %s", e)
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -808,11 +838,22 @@ class LMCacheConnectorV1Impl:
         # don't use prefill_start there, and syncing would stall the
         # decode forward pipeline and perturb client-side ITL.
         is_prefill_producer = self.kv_role == "kv_producer"
+        is_kv_consumer = self.kv_role == "kv_consumer"
         t_prefill_start: Optional[float] = None
         if is_prefill_producer:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            t_prefill_start = time.perf_counter()
+            t_prefill_start = time.time()
+
+        # Consumer-side KV pull timing: record the instant we enter
+        # start_load_kv on the decode side. This is t_kv_mnck_out_start
+        # in the user-facing taxonomy — "when decode begins reading KV
+        # from its Mooncake segment". No sync here: Mooncake Get is a
+        # CPU-side RDMA READ, not a CUDA op, and syncing would stall
+        # the decode pipeline and perturb ITL.
+        t_kv_mnck_out_start: Optional[float] = None
+        if is_kv_consumer:
+            t_kv_mnck_out_start = time.time()
 
         self.current_layer = 0
 
@@ -836,6 +877,20 @@ class LMCacheConnectorV1Impl:
                     request.req_id, t_prefill_start
                 )
 
+        # Record t_kv_mnck_out_start per consumer request (setdefault so
+        # chunked prefill reuses the first entry).
+        if is_kv_consumer and t_kv_mnck_out_start is not None:
+            if not hasattr(self, "_kv_mnck_out_start_times"):
+                self._kv_mnck_out_start_times: dict[str, float] = {}
+            for request in metadata.requests:
+                if (
+                    request.load_spec is not None
+                    and request.load_spec.can_load
+                ):
+                    self._kv_mnck_out_start_times.setdefault(
+                        request.req_id, t_kv_mnck_out_start
+                    )
+
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
@@ -847,6 +902,10 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self.layerwise_retrievers = []
+        # Parallel list: req_id for each retriever appended below.
+        # wait_for_layer_load uses this on the last layer to emit the
+        # consumer-side JSONL metric line.
+        self._layerwise_retriever_req_ids: list[str] = []
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None or not request.load_spec.can_load:
@@ -908,6 +967,9 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._layerwise_retriever_req_ids.append(
+                        request.req_id
+                    )
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
@@ -918,6 +980,27 @@ class LMCacheConnectorV1Impl:
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                 )
+
+                # Non-layerwise consumer: retrieve() returns after all
+                # CPU→GPU memcpys are ENQUEUED. To make t_kv_end mean
+                # "KV actually in GPU paged buffer", we synchronize the
+                # CUDA stream before taking the timestamp. This stalls
+                # decode forward but is what the user asked for (clean
+                # KV-load metric).
+                if is_kv_consumer:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_kv_end = time.time()
+                    mo_start_map = getattr(
+                        self, "_kv_mnck_out_start_times", {}
+                    )
+                    t_mo_start = mo_start_map.pop(
+                        request.req_id, t_kv_end
+                    )
+                    self._write_consumer_metric(
+                        request.req_id, "non_layerwise",
+                        t_mo_start, t_kv_end,
+                    )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -1034,6 +1117,11 @@ class LMCacheConnectorV1Impl:
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
+        is_last_layer = (
+            self.layerwise_retrievers
+            and self.current_layer == self.num_layers - 1
+        )
+
         # Wait for the layer to be loaded
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
@@ -1042,6 +1130,25 @@ class LMCacheConnectorV1Impl:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+
+        if is_last_layer and self.kv_role == "kv_consumer":
+            # The retrieve_layer generator's final iteration calls
+            # `next(mem_obj_consumer)` which internally synchronizes the
+            # last layer's CPU→GPU copy. Add an explicit sync anyway so
+            # t_kv_end is guaranteed to be "KV fully in GPU paged buffer"
+            # regardless of whether the gpu_connector skipped its own
+            # sync for any reason.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_kv_end = time.time()
+            mo_start_map = getattr(self, "_kv_mnck_out_start_times", {})
+            for req_id in self._layerwise_retriever_req_ids:
+                t_mo_start = mo_start_map.pop(req_id, t_kv_end)
+                self._write_consumer_metric(
+                    req_id, "layerwise",
+                    t_mo_start, t_kv_end,
+                )
+            self._layerwise_retriever_req_ids = []
 
         if self.layerwise_retrievers:
             self.current_layer += 1
@@ -1148,13 +1255,15 @@ class LMCacheConnectorV1Impl:
                     is_first = False
 
             # Record the moment the KV pipeline first starts for this
-            # request. This is *before* any RDMA submit — it covers the
-            # first GPU→CPU layer offload, so the reported `kv_total`
-            # matches the user-visible definition "KV 传输开始到 KV 传输结束".
+            # request — first save_kv_layer call. This is *before* any
+            # RDMA submit and covers the first GPU→CPU layer offload,
+            # matching "KV 传输开始" semantics. No cuda sync here: adding
+            # one inside the forward pass would break overlap's whole
+            # point (pipelining save with compute).
             if not hasattr(self, "_kv_pipeline_start"):
                 self._kv_pipeline_start: dict[str, float] = {}
             self._kv_pipeline_start.setdefault(
-                request.req_id, time.perf_counter()
+                request.req_id, time.time()
             )
 
             next(layerwise_storer)
@@ -1184,7 +1293,7 @@ class LMCacheConnectorV1Impl:
             # actual end-of-compute, not last-kernel-launched.
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            t_prefill_end = time.perf_counter()
+            t_prefill_end = time.time()
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
@@ -1196,11 +1305,11 @@ class LMCacheConnectorV1Impl:
 
             # After all generators flushed, RDMA Puts have been SUBMITTED
             # but not necessarily completed. Block per-request on the
-            # remote backend's Put-completion tracker so we use the true
-            # wall-clock "last-RDMA-done" for kv_total / kv_exposed.
-            # t_kv_start here is the FIRST save_kv_layer call (captured in
-            # save_kv_layer above) so kv_total spans the whole pipeline
-            # from "first KV begins to move" to "last KV done".
+            # remote backend's Put-completion tracker to recover the
+            # real wall-clock "last-CQE-done" for t_kv_mnck_in_end.
+            # t_kv_start is the FIRST save_kv_layer call (captured in
+            # save_kv_layer above) — that's when the KV pipeline first
+            # starts moving data for the request.
             remote_backend = self._get_remote_backend()
             prefill_starts = getattr(self, "_prefill_start_times", {})
             kv_pipeline_starts = getattr(self, "_kv_pipeline_start", {})
@@ -1211,21 +1320,17 @@ class LMCacheConnectorV1Impl:
                 t_kv_start = kv_pipeline_starts.pop(
                     request.req_id, t_prefill_end
                 )
-                t_kv_end_req: Optional[float] = None
+                t_kv_mnck_in_end: Optional[float] = None
                 if remote_backend is not None:
-                    _, t_kv_end_req = remote_backend.wait_put_done(
+                    _, t_kv_mnck_in_end = remote_backend.wait_put_done(
                         request.req_id
                     )
-                if t_kv_end_req is None:
-                    t_kv_end_req = time.perf_counter()
-                prefill_ms = (t_prefill_end - t_prefill_start) * 1000
-                kv_total_ms = (t_kv_end_req - t_kv_start) * 1000
-                kv_exposed_ms = max(
-                    0.0, (t_kv_end_req - t_prefill_end) * 1000
-                )
-                self._write_metric_line(
-                    request.req_id, prefill_ms, kv_total_ms,
-                    kv_exposed_ms, "layerwise",
+                if t_kv_mnck_in_end is None:
+                    t_kv_mnck_in_end = time.time()
+                self._write_producer_metric(
+                    request.req_id, "layerwise",
+                    t_prefill_start, t_prefill_end,
+                    t_kv_start, t_kv_mnck_in_end,
                 )
             return
 
@@ -1234,7 +1339,7 @@ class LMCacheConnectorV1Impl:
         # kernel was merely launched.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        t_prefill_end = time.perf_counter()
+        t_prefill_end = time.time()
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -1330,29 +1435,26 @@ class LMCacheConnectorV1Impl:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
 
         # Phase 2: for every request whose Puts were submitted, wait for
-        # real RDMA completion and emit the metrics line.
-        # In non-overlap mode the KV pipeline (GPU→CPU offload + RDMA) all
-        # happens inside wait_for_save, so kv_total and kv_exposed both
-        # span `t_prefill_end → last-RDMA-done` — they are definitionally
-        # equal, which matches the user-visible expectation.
+        # real RDMA completion and emit the producer JSONL line.
+        # In non-overlap the KV pipeline (GPU→CPU offload + Put) all
+        # happens inside wait_for_save, so t_kv_start == t_prefill_end
+        # by definition — matching the user's expectation that
+        # non-overlap's "KV 传输开始到 KV 传输结束" is just the wait_for_save
+        # window.
         remote_backend = self._get_remote_backend()
         prefill_starts = getattr(self, "_prefill_start_times", {})
         for req_id in submitted_req_ids:
             t_prefill_start = prefill_starts.pop(req_id, t_prefill_end)
-            t_kv_end_req: Optional[float] = None
+            t_kv_mnck_in_end: Optional[float] = None
             if remote_backend is not None:
-                _, t_kv_end_req = remote_backend.wait_put_done(req_id)
-            if t_kv_end_req is None:
-                t_kv_end_req = time.perf_counter()
-            prefill_ms = (t_prefill_end - t_prefill_start) * 1000
-            kv_window_ms = max(
-                0.0, (t_kv_end_req - t_prefill_end) * 1000
-            )
-            self._write_metric_line(
-                req_id, prefill_ms,
-                kv_window_ms,    # kv_total = whole offload+RDMA window
-                kv_window_ms,    # kv_exposed = same (non-overlap)
-                "non_layerwise",
+                _, t_kv_mnck_in_end = remote_backend.wait_put_done(req_id)
+            if t_kv_mnck_in_end is None:
+                t_kv_mnck_in_end = time.time()
+            self._write_producer_metric(
+                req_id, "non_layerwise",
+                t_prefill_start, t_prefill_end,
+                t_prefill_end,      # t_kv_start == t_prefill_end in non-overlap
+                t_kv_mnck_in_end,
             )
 
     @_lmcache_nvtx_annotate
