@@ -184,7 +184,15 @@ class InstrumentedRemoteConnector(RemoteConnector):
         try:
             await self._connector.batched_put(keys, memory_objs, **kwargs)
         except Exception as e:
-            logger.warning(f"batched put error: {e}")
+            # Upgraded from warning to error with full traceback: a
+            # silent str(e) hid a pybind11 TypeError that made every
+            # Mooncake batch_put_from fail for weeks
+            # (see proxy ClientInfo kwargs fix). Raise visibility so
+            # future arg-mismatch regressions are immediately obvious.
+            logger.error(
+                "batched put error (%s): %s", type(e).__name__, e,
+                exc_info=True,
+            )
         finally:
             for memory_obj in memory_objs:
                 memory_obj.ref_count_down()
