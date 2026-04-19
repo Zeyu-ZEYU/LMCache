@@ -891,17 +891,32 @@ class LMCacheEngine:
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
         if not self._is_passive():
+            # Split the retrieve span into its two constituent phases
+            # so we can see which one scales badly at large input_len:
+            #   process_tokens_time: Mooncake Get → memory_obj build
+            #   to_gpu_time:         CPU→GPU memcpy enqueue
+            # Neither includes the trailing load_stream.synchronize()
+            # that the consumer adapter does — so onload_time may be
+            # slightly larger than (process+to_gpu).
+            pt_ms = retrieve_stats.process_tokens_time * 1000
+            tg_ms = retrieve_stats.to_gpu_time * 1000
+            bw = (
+                tot_kv_size / onload_time / 1024**3
+                if onload_time > 0 else 0
+            )
             logger.info(
                 "[req_id=%s] Retrieved %d out of %d required tokens "
                 "(from %d total tokens). size: %.4f gb, "
-                "cost %.4f ms, throughput: %.4f GB/s;",
+                "cost %.4f ms (process_tokens=%.2f, to_gpu_enqueue="
+                "%.2f), throughput: %.4f GB/s;",
                 req_id,
                 retrieved_tokens,
                 num_required_tokens,
                 len(tokens),
                 tot_kv_size / 1024**3,
                 onload_time * 1000,
-                tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
+                pt_ms, tg_ms,
+                bw,
             )
         return ret_mask
 
