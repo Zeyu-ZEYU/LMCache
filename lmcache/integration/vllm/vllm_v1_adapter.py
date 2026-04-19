@@ -997,8 +997,15 @@ class LMCacheConnectorV1Impl:
                     t_mo_start = mo_start_map.pop(
                         request.req_id, t_kv_end
                     )
+                    # Join key for the benchmark: the proxy's
+                    # correlation_id (= prefill's completion id) if
+                    # present, else fall back to vLLM's req_id.
+                    corr_map = getattr(self, "_consumer_correlation_ids", {})
+                    jsonl_id = corr_map.pop(
+                        request.req_id, request.req_id
+                    )
                     self._write_consumer_metric(
-                        request.req_id, "non_layerwise",
+                        jsonl_id, "non_layerwise",
                         t_mo_start, t_kv_end,
                     )
 
@@ -1142,10 +1149,15 @@ class LMCacheConnectorV1Impl:
                 torch.cuda.synchronize()
             t_kv_end = time.time()
             mo_start_map = getattr(self, "_kv_mnck_out_start_times", {})
+            corr_map = getattr(self, "_consumer_correlation_ids", {})
             for req_id in self._layerwise_retriever_req_ids:
                 t_mo_start = mo_start_map.pop(req_id, t_kv_end)
+                # Join key for the benchmark: correlation_id (proxy's
+                # injected prefill completion id) if present, else the
+                # vLLM internal req_id.
+                jsonl_id = corr_map.pop(req_id, req_id)
                 self._write_consumer_metric(
-                    req_id, "layerwise",
+                    jsonl_id, "layerwise",
                     t_mo_start, t_kv_end,
                 )
             self._layerwise_retriever_req_ids = []
@@ -1654,6 +1666,24 @@ class LMCacheConnectorV1Impl:
             )
 
             tmp_disagg_tracker[request.request_id] = disagg_spec
+
+        # Decode-side: capture the proxy's correlation_id (= prefill's
+        # completion id, i.e., the first-chunk id the client sees) so
+        # the consumer JSONL can be joined with the producer JSONL by a
+        # single key. Without this, decode's vLLM-internal req_id is a
+        # different cmpl-<hex> than prefill's, and the benchmark's
+        # prefix-match join fails on the consumer side.
+        if (
+            self.kv_role == "kv_consumer"
+            and kv_transfer_params is not None
+            and "correlation_id" in kv_transfer_params
+        ):
+            if not hasattr(self, "_consumer_correlation_ids"):
+                self._consumer_correlation_ids: dict[str, str] = {}
+            self._consumer_correlation_ids[request.request_id] = (
+                kv_transfer_params["correlation_id"]
+            )
+
         self._unfinished_requests[request.request_id] = request
 
         if request.request_id not in self.load_specs:
