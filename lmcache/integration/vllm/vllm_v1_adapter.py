@@ -91,6 +91,14 @@ class DisaggSpec:
 
 
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
+# Module-level staging for proxy-injected correlation_id on decode side.
+# update_state_after_alloc runs in the scheduler process; the consumer
+# JSONL is emitted in the worker process (different Python process, so
+# a per-instance dict attribute would not survive the hop). We key by
+# vLLM's request.req_id and drain it into RequestTracker.correlation_id
+# during from_new_request_data, which IS carried into ReqMeta and
+# shipped to workers via build_connector_meta.
+tmp_correlation_id_tracker: dict[str, str] = {}
 
 
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
@@ -142,6 +150,11 @@ class RequestTracker:
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
 
+    # Proxy-injected join key (= prefill's completion id) for decode's
+    # consumer JSONL — lets the benchmark prefix-match producer JSONL
+    # (which already starts with prefill's id) against consumer JSONL.
+    correlation_id: Optional[str] = None
+
     @_lmcache_nvtx_annotate
     @staticmethod
     def from_new_request(
@@ -185,6 +198,9 @@ class RequestTracker:
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
+        correlation_id = tmp_correlation_id_tracker.pop(
+            new_request.req_id, None
+        )
 
         request_configs = extract_request_configs(new_request.sampling_params)
 
@@ -202,6 +218,7 @@ class RequestTracker:
             skip_save=skip_save,
             request_configs=request_configs,
             num_lmcache_cached_tokens=lmcache_cached_tokens,
+            correlation_id=correlation_id,
         )
 
     def update(
@@ -292,6 +309,10 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Proxy-injected join key (= prefill's completion id) for decode's
+    # consumer JSONL. Passed through from RequestTracker so the worker
+    # process can use it when writing consumer metrics.
+    correlation_id: Optional[str] = None
 
     @staticmethod
     def from_request_tracker(
@@ -425,6 +446,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            correlation_id=tracker.correlation_id,
         )
 
 
@@ -739,6 +761,22 @@ class LMCacheConnectorV1Impl:
     _METRICS_FILE_PRODUCER = "/home/zeyu/lmcache_metrics_producer.jsonl"
     _METRICS_FILE_CONSUMER = "/home/zeyu/lmcache_metrics_consumer.jsonl"
 
+    @staticmethod
+    def _normalize_jsonl_req_id(req_id: str) -> str:
+        """Collapse vLLM's four-part internal ``cmpl-<hex>-<rank>-<uuid>``
+        down to the two-part completion id ``cmpl-<hex>`` that the
+        client sees in its first streaming chunk. Producer and consumer
+        sides both normalize to this same form, letting the benchmark's
+        server-side metric join match both sides with a single key
+        instead of multiple prefix-match hits.
+        """
+        if req_id is None or not req_id.startswith("cmpl-"):
+            return req_id
+        parts = req_id.split("-")
+        if len(parts) >= 2:
+            return "-".join(parts[:2])
+        return req_id
+
     def _get_remote_backend(self):
         """Return the RemoteBackend instance, or None if not present.
 
@@ -902,10 +940,12 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self.layerwise_retrievers = []
-        # Parallel list: req_id for each retriever appended below.
-        # wait_for_layer_load uses this on the last layer to emit the
-        # consumer-side JSONL metric line.
-        self._layerwise_retriever_req_ids: list[str] = []
+        # Parallel list: (req_id, correlation_id) for each retriever
+        # appended below. wait_for_layer_load uses this on the last
+        # layer to emit the consumer-side JSONL metric line, keying by
+        # correlation_id when available so producer+consumer records
+        # join on a single key (= client's first-chunk id).
+        self._layerwise_retriever_req_ids: list[tuple[str, Optional[str]]] = []
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None or not request.load_spec.can_load:
@@ -968,7 +1008,7 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
                     self._layerwise_retriever_req_ids.append(
-                        request.req_id
+                        (request.req_id, request.correlation_id)
                     )
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
@@ -997,12 +1037,15 @@ class LMCacheConnectorV1Impl:
                     t_mo_start = mo_start_map.pop(
                         request.req_id, t_kv_end
                     )
-                    # Join key for the benchmark: the proxy's
-                    # correlation_id (= prefill's completion id) if
-                    # present, else fall back to vLLM's req_id.
-                    corr_map = getattr(self, "_consumer_correlation_ids", {})
-                    jsonl_id = corr_map.pop(
-                        request.req_id, request.req_id
+                    # Join key = proxy's correlation_id (= prefill's
+                    # completion id = client's first-chunk id) carried
+                    # through ReqMeta from the scheduler. Fallback to
+                    # vLLM's req_id (normalized to match producer's
+                    # key format) in standalone/LMCache-only setups
+                    # where no proxy injected a correlation_id.
+                    jsonl_id = (
+                        request.correlation_id
+                        or self._normalize_jsonl_req_id(request.req_id)
                     )
                     self._write_consumer_metric(
                         jsonl_id, "non_layerwise",
@@ -1149,13 +1192,15 @@ class LMCacheConnectorV1Impl:
                 torch.cuda.synchronize()
             t_kv_end = time.time()
             mo_start_map = getattr(self, "_kv_mnck_out_start_times", {})
-            corr_map = getattr(self, "_consumer_correlation_ids", {})
-            for req_id in self._layerwise_retriever_req_ids:
+            for req_id, correlation_id in self._layerwise_retriever_req_ids:
                 t_mo_start = mo_start_map.pop(req_id, t_kv_end)
-                # Join key for the benchmark: correlation_id (proxy's
-                # injected prefill completion id) if present, else the
-                # vLLM internal req_id.
-                jsonl_id = corr_map.pop(req_id, req_id)
+                # Join key = proxy's correlation_id (= prefill's
+                # completion id) if present, else vLLM's req_id
+                # normalized to match producer's key format.
+                jsonl_id = (
+                    correlation_id
+                    or self._normalize_jsonl_req_id(req_id)
+                )
                 self._write_consumer_metric(
                     jsonl_id, "layerwise",
                     t_mo_start, t_kv_end,
@@ -1340,7 +1385,8 @@ class LMCacheConnectorV1Impl:
                 if t_kv_mnck_in_end is None:
                     t_kv_mnck_in_end = time.time()
                 self._write_producer_metric(
-                    request.req_id, "layerwise",
+                    self._normalize_jsonl_req_id(request.req_id),
+                    "layerwise",
                     t_prefill_start, t_prefill_end,
                     t_kv_start, t_kv_mnck_in_end,
                 )
@@ -1463,7 +1509,8 @@ class LMCacheConnectorV1Impl:
             if t_kv_mnck_in_end is None:
                 t_kv_mnck_in_end = time.time()
             self._write_producer_metric(
-                req_id, "non_layerwise",
+                self._normalize_jsonl_req_id(req_id),
+                "non_layerwise",
                 t_prefill_start, t_prefill_end,
                 t_prefill_end,      # t_kv_start == t_prefill_end in non-overlap
                 t_kv_mnck_in_end,
@@ -1668,19 +1715,19 @@ class LMCacheConnectorV1Impl:
             tmp_disagg_tracker[request.request_id] = disagg_spec
 
         # Decode-side: capture the proxy's correlation_id (= prefill's
-        # completion id, i.e., the first-chunk id the client sees) so
-        # the consumer JSONL can be joined with the producer JSONL by a
-        # single key. Without this, decode's vLLM-internal req_id is a
-        # different cmpl-<hex> than prefill's, and the benchmark's
-        # prefix-match join fails on the consumer side.
+        # completion id, i.e., the first-chunk id the client sees) into
+        # a module-level staging dict, keyed by vLLM's req_id. The
+        # worker process (different from the scheduler process running
+        # this hook) will pick it up when RequestTracker is built via
+        # from_new_request_data, then pass it through ReqMeta → worker.
+        # This is the only correlation path that survives the
+        # scheduler→worker boundary.
         if (
             self.kv_role == "kv_consumer"
             and kv_transfer_params is not None
             and "correlation_id" in kv_transfer_params
         ):
-            if not hasattr(self, "_consumer_correlation_ids"):
-                self._consumer_correlation_ids: dict[str, str] = {}
-            self._consumer_correlation_ids[request.request_id] = (
+            tmp_correlation_id_tracker[request.request_id] = (
                 kv_transfer_params["correlation_id"]
             )
 
