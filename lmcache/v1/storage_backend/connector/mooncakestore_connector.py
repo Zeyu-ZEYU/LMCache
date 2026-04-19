@@ -5,6 +5,7 @@ from typing import List, Optional, no_type_check
 import asyncio
 import json
 import os
+import time
 
 # Third Party
 import torch
@@ -445,13 +446,16 @@ class MooncakestoreConnector(RemoteConnector):
         """
         key_strs = [key.to_string() for key in keys]
 
+        t_rdma_start = time.perf_counter()
         try:
             buffers = await asyncio.to_thread(self.store.batch_get_buffer, key_strs)
         except Exception as e:
             logger.error(f"batch_get_buffer failed: {str(e)}")
             return [None] * len(keys)
+        t_rdma_end = time.perf_counter()
 
         results: list[Optional[MemoryObj]] = []
+        tot_bytes = 0
         for i, buffer in enumerate(buffers):
             if buffer is None:
                 logger.warning(f"Buffer {i} is None for key {key_strs[i]}")
@@ -460,11 +464,32 @@ class MooncakestoreConnector(RemoteConnector):
             try:
                 memory_obj = self._process_buffer_with_metadata(buffer)
                 results.append(memory_obj)
+                if memory_obj is not None:
+                    tot_bytes += memory_obj.get_size()
             except Exception as e:
                 logger.error(
                     f"Failed to process buffer {i} for key {key_strs[i]}: {str(e)}"
                 )
                 results.append(None)
+        t_copy_end = time.perf_counter()
+
+        # Split timing: isolate Mooncake RDMA READ from the per-chunk
+        # CPU memcpy (memory_obj.raw_tensor.copy_(temp_tensor)) that
+        # happens in _process_buffer_with_metadata. For long contexts
+        # (many chunks) the CPU-copy tail becomes non-trivial and this
+        # split lets us see whether slow first-calls are RDMA-side
+        # (QP warmup / metadata lookup) or CPU-side.
+        rdma_ms = (t_rdma_end - t_rdma_start) * 1000
+        cpu_ms = (t_copy_end - t_rdma_end) * 1000
+        logger.info(
+            "Mooncake batch_get: %d keys, %.2f MB, rdma=%.2f ms, "
+            "cpu_copy=%.2f ms (rdma_bw=%.2f GB/s)",
+            len(keys),
+            tot_bytes / (1024 * 1024),
+            rdma_ms,
+            cpu_ms,
+            (tot_bytes / max(t_rdma_end - t_rdma_start, 1e-9)) / 1024**3,
+        )
         return results
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
