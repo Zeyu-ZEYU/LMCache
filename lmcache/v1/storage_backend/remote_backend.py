@@ -519,20 +519,35 @@ class RemoteBackend(StorageBackendInterface):
                                 f"on_complete_callback failed for key {key}: {e}"
                             )
 
-            # Extract preferred_segment from transfer_spec for
-            # targeted RDMA WRITE (e.g., to decode node's segment).
-            # Only Mooncake connector supports preferred_segment.
-            preferred_segment = None
-            if transfer_spec is not None and hasattr(
-                transfer_spec, "receiver_rdma_host"
-            ):
-                preferred_segment = getattr(
-                    transfer_spec, "receiver_rdma_host", None
-                )
+            # Extract preferred_segment for targeted RDMA WRITE to the
+            # decode node's own Mooncake segment. Tail and head are TWO
+            # separate segments on the same Mooncake master (different
+            # local_hostname per register):
+            #   tail = decode's IPv6 on mlx5_bond_* (transfer_spec
+            #          .receiver_rdma_host)
+            #   head = decode's IPv4 on mlx5_0 (transfer_spec.receiver_host,
+            #          which is the eth0 hostname the proxy already carries)
+            # Passing the wrong family to a connector yields a silent
+            # Mooncake NoSuchSegment failure, so they MUST be distinct.
+            tail_preferred_segment = None
+            head_preferred_segment = None
+            if transfer_spec is not None:
+                if hasattr(transfer_spec, "receiver_rdma_host"):
+                    tail_preferred_segment = getattr(
+                        transfer_spec, "receiver_rdma_host", None
+                    )
+                if hasattr(transfer_spec, "receiver_host"):
+                    head_preferred_segment = getattr(
+                        transfer_spec, "receiver_host", None
+                    )
 
-            put_kwargs: dict = {}
-            if preferred_segment:
-                put_kwargs["preferred_segment"] = preferred_segment
+            tail_put_kwargs: dict = {}
+            if tail_preferred_segment:
+                tail_put_kwargs["preferred_segment"] = tail_preferred_segment
+
+            head_put_kwargs: dict = {}
+            if head_preferred_segment:
+                head_put_kwargs["preferred_segment"] = head_preferred_segment
 
             # --- Head NIC routing (lazy init) ---
             if (
@@ -556,7 +571,9 @@ class RemoteBackend(StorageBackendInterface):
                     h_keys = [keys[i] for i in head_idx]
                     h_objs = [compressed_memory_objs[i] for i in head_idx]
                     hf = asyncio.run_coroutine_threadsafe(
-                        self.head_connection.batched_put(h_keys, h_objs),
+                        self.head_connection.batched_put(
+                            h_keys, h_objs, **head_put_kwargs
+                        ),
                         self.loop,
                     )
                     self._track_put_submit(req_id, hf)
@@ -566,7 +583,7 @@ class RemoteBackend(StorageBackendInterface):
                     t_objs = [compressed_memory_objs[i] for i in tail_idx]
                     tf = asyncio.run_coroutine_threadsafe(
                         self.connection.batched_put(
-                            t_keys, t_objs, **put_kwargs
+                            t_keys, t_objs, **tail_put_kwargs
                         ),
                         self.loop,
                     )
@@ -576,7 +593,7 @@ class RemoteBackend(StorageBackendInterface):
                 # Default: all chunks via tail (main connection)
                 future = asyncio.run_coroutine_threadsafe(
                     self.connection.batched_put(
-                        keys, compressed_memory_objs, **put_kwargs
+                        keys, compressed_memory_objs, **tail_put_kwargs
                     ),
                     self.loop,
                 )
