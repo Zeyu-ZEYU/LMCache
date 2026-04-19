@@ -1183,13 +1183,28 @@ class LMCacheConnectorV1Impl:
 
         if is_last_layer and self.kv_role == "kv_consumer":
             # The retrieve_layer generator's final iteration calls
-            # `next(mem_obj_consumer)` which internally synchronizes the
-            # last layer's CPU→GPU copy. Add an explicit sync anyway so
-            # t_kv_end is guaranteed to be "KV fully in GPU paged buffer"
-            # regardless of whether the gpu_connector skipped its own
-            # sync for any reason.
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            # `current_stream.wait_stream(load_stream)` inside
+            # gpu_connector.batched_to_gpu (at cache_engine.py:1042
+            # `next(mem_obj_consumer)`). That's a stream-level
+            # ordering fence — the decode forward kernel queued next
+            # on current_stream will observe the finished H2D copy —
+            # but it doesn't block the host thread. For t_kv_end to
+            # reflect host time at which the KV is actually resident
+            # in the GPU paged buffer we want a host-blocking sync
+            # here. Use load_stream.synchronize() rather than a
+            # device-wide cuda.synchronize() because overlap mode
+            # may have other streams doing unrelated work (prefill-
+            # stream, compute-stream, NCCL-stream), and
+            # cuda.synchronize() on the device sometimes interacts
+            # poorly with enforcing kernels / CUDA graphs in the
+            # forward path and stalls indefinitely.
+            try:
+                if self.gpu_connector is not None and hasattr(
+                    self.gpu_connector, "load_stream"
+                ):
+                    self.gpu_connector.load_stream.synchronize()
+            except Exception as e:
+                logger.debug("load_stream.synchronize() failed: %s", e)
             t_kv_end = time.time()
             mo_start_map = getattr(self, "_kv_mnck_out_start_times", {})
             for req_id, correlation_id in self._layerwise_retriever_req_ids:
