@@ -309,6 +309,37 @@ class MooncakestoreConnector(RemoteConnector):
             # Use optimized mode with local metadata
             return await self._batch_get_into(keys)
 
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        """Override the default (which iterates self.get(key) per key)
+        because Mooncake doesn't support single-key get() — only
+        batched. Without this override, the layerwise retrieve path in
+        cache_engine.py spams a NotImplementedError per key per layer
+        and decode hangs waiting for KV that never arrived.
+
+        Returns only the consecutive prefix of successfully retrieved
+        memory objects (same contract as base class).
+        """
+        if not keys:
+            return []
+        memory_objs = await self.batched_get(keys)
+        # Mirror the base class contract: stop at the first None and
+        # release anything after.
+        result: List[MemoryObj] = []
+        seen_failure = False
+        for obj in memory_objs:
+            if seen_failure:
+                if obj is not None:
+                    obj.ref_count_down()
+            elif obj is None:
+                seen_failure = True
+            else:
+                result.append(obj)
+        return result
+
     def support_batched_async_contains(self) -> bool:
         return True
 
