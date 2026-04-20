@@ -35,4 +35,6 @@ def route_kv_chunk(
       - Use a percentage: e.g., return "head" if chunk_id < num_chunks * 0.3
         to send 30% of chunks via head NIC.
     """
-    return "tail"
+    # TEMP experiment: force all KV via head NIC (mlx5_0) to validate
+    # the head path end-to-end. Revert to "tail" for default behavior.
+    return "head"
