@@ -145,9 +145,12 @@ class RouteDispatchBackend(StorageBackendInterface):
         num_layers: int = 0,
         req_id: Optional[str] = None,
     ) -> Union[List[Future], None]:
-        # Bypass when head-split isn't wired up, or when we can't route
-        # (layer_id unknown → non-layerwise non-overlap mode).
-        if self.head is None or layer_id is None:
+        # Bypass only when head-split isn't wired up. route_kv_chunk always
+        # gets a call, even in non-layerwise (non-overlap) mode — there we
+        # pass layer_id=0 / num_layers=1 so the routing function can still
+        # pick per-chunk. Without this, non-overlap would silently send all
+        # KV via tail regardless of what route_kv_chunk returns.
+        if self.head is None:
             return self.tail.batched_submit_put_task(
                 keys,
                 objs,
@@ -158,11 +161,17 @@ class RouteDispatchBackend(StorageBackendInterface):
                 req_id=req_id,
             )
 
+        # Effective routing coords. When the caller didn't thread layer
+        # info (non-overlap path), use (0, 1) so route_kv_chunk sees a
+        # valid single-layer argument space.
+        eff_layer = layer_id if layer_id is not None else 0
+        eff_num_layers = num_layers if num_layers > 0 else 1
+
         num_chunks = len(keys)
         head_idx: list[int] = []
         tail_idx: list[int] = []
         for ci in range(num_chunks):
-            route = route_kv_chunk(layer_id, ci, num_layers, num_chunks)
+            route = route_kv_chunk(eff_layer, ci, eff_num_layers, num_chunks)
             if route == "head":
                 head_idx.append(ci)
             else:
@@ -253,15 +262,18 @@ class RouteDispatchBackend(StorageBackendInterface):
         if self.head is None or not keys:
             return self.tail.batched_get_blocking(keys, num_layers=num_layers)
 
+        # Mirror the Put-path contract: always consult route_kv_chunk. If
+        # the key doesn't carry layer_id (non-layerwise mode), use 0 /
+        # num_layers=1 so the routing function still dispatches.
         layer_id = getattr(keys[0], "layer_id", None)
-        if layer_id is None:
-            return self.tail.batched_get_blocking(keys, num_layers=num_layers)
+        eff_layer = layer_id if layer_id is not None else 0
+        eff_num_layers = num_layers if num_layers > 0 else 1
 
         num_chunks = len(keys)
         head_idx: list[int] = []
         tail_idx: list[int] = []
         for ci in range(num_chunks):
-            route = route_kv_chunk(layer_id, ci, num_layers, num_chunks)
+            route = route_kv_chunk(eff_layer, ci, eff_num_layers, num_chunks)
             if route == "head":
                 head_idx.append(ci)
             else:
