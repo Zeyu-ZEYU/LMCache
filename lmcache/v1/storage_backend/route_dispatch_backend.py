@@ -11,11 +11,12 @@ The cluster has two RDMA planes per node:
 
 We want to ship some KV chunks via the head plane so they don't contend with
 the MoE EP all-to-all traffic on tail during prefill / decode forward. The
-routing decision is per (layer_id, chunk_id) via
-:func:`lmcache.v1.kv_routing.route_kv_chunk` — a deterministic placeholder
-function. Producer and consumer MUST agree on the route for any given chunk
-because head and tail Mooncake segments are registered on different devices
-and are not inter-reachable.
+routing decision is made per layer-level batch by
+:func:`lmcache.v1.kv_routing.route_kv_chunks`, which returns two disjoint
+index lists (``head_indices`` / ``tail_indices``) for all chunks in the
+batch at once. Producer and consumer MUST agree on the route for any given
+(layer_id, chunk_id) because head and tail Mooncake segments are registered
+on different devices and are not inter-reachable.
 
 Design: Two RemoteBackends, not one
 -----------------------------------
@@ -30,7 +31,7 @@ the 60 s hard timeout on the tail path.
 The correct shape is **two real ``RemoteBackend`` instances**, each owning
 its private ``LocalCPUBackend`` → private pinned pool → private MR, each
 registered with exactly one device. The wrapper below routes chunks per
-:func:`route_kv_chunk` and dispatches to the appropriate backend.
+:func:`route_kv_chunks` and dispatches to the appropriate backend.
 
 Memory flow
 -----------
@@ -53,12 +54,29 @@ shows up in benchmarks we can later route allocation itself instead
 of copying — but for correctness-first this is the simplest working
 shape.
 
-route_kv_chunk agreement between producer / consumer
-----------------------------------------------------
-The routing decision is pure in (layer_id, chunk_id, num_layers,
-num_chunks), so producer and consumer running the same function derive
-the same route for the same chunk. We rely on that property; the
-wrapper never persists the decision.
+route_kv_chunks agreement between producer / consumer
+-----------------------------------------------------
+The routing decision is pure in (layer_id, num_layers, num_chunks), so
+producer and consumer running the same function derive the same
+partition for the same batch. We rely on that property; the wrapper
+never persists the decision.
+
+Why a batch interface, not a per-chunk function
+-----------------------------------------------
+An earlier iteration called ``route_kv_chunk(layer_id, chunk_id, ...)``
+once per chunk inside a Python ``for`` loop, then materialized two
+index lists by per-chunk ``append``. Profiling showed this was the
+dominant extra cost in the head-split-enabled-but-route-all-tail
+experiment (the common "sanity-check" configuration): on Qwen3-235B at
+8000-token input, ~3000 chunks/request × ~0.5 µs/call = ~1.5 ms per
+request of pure Python dispatch.
+
+The batched signature ``route_kv_chunks(layer_id, num_layers,
+num_chunks) -> (head_idx, tail_idx)`` lets the default "all tail" /
+"all head" case run in constant time (just return a pre-built list)
+and keeps heterogeneous routing schemes honest about their cost. The
+wrapper further skips the list-rebuild step on the fast "all tail"
+branch.
 
 Bypass behavior
 ---------------
@@ -76,7 +94,7 @@ from typing import Any, Callable, List, Optional, Sequence, Union
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.kv_routing import route_kv_chunk
+from lmcache.v1.kv_routing import route_kv_chunks
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -145,11 +163,7 @@ class RouteDispatchBackend(StorageBackendInterface):
         num_layers: int = 0,
         req_id: Optional[str] = None,
     ) -> Union[List[Future], None]:
-        # Bypass only when head-split isn't wired up. route_kv_chunk always
-        # gets a call, even in non-layerwise (non-overlap) mode — there we
-        # pass layer_id=0 / num_layers=1 so the routing function can still
-        # pick per-chunk. Without this, non-overlap would silently send all
-        # KV via tail regardless of what route_kv_chunk returns.
+        # Bypass when head-split isn't wired up at all.
         if self.head is None:
             return self.tail.batched_submit_put_task(
                 keys,
@@ -162,29 +176,30 @@ class RouteDispatchBackend(StorageBackendInterface):
             )
 
         # Effective routing coords. When the caller didn't thread layer
-        # info (non-overlap path), use (0, 1) so route_kv_chunk sees a
-        # valid single-layer argument space.
+        # info (non-overlap path), use (0, 1) so route_kv_chunks sees a
+        # valid single-layer argument space. Without this fallback,
+        # non-overlap would silently route everything to tail regardless
+        # of what the routing function wants.
         eff_layer = layer_id if layer_id is not None else 0
         eff_num_layers = num_layers if num_layers > 0 else 1
-
         num_chunks = len(keys)
-        head_idx: list[int] = []
-        tail_idx: list[int] = []
-        for ci in range(num_chunks):
-            route = route_kv_chunk(eff_layer, ci, eff_num_layers, num_chunks)
-            if route == "head":
-                head_idx.append(ci)
-            else:
-                tail_idx.append(ci)
 
-        # Tail side: direct pass-through (no staging needed, chunks are
-        # already in tail's pool).
-        if tail_idx:
-            t_keys = [keys[i] for i in tail_idx]
-            t_objs = [objs[i] for i in tail_idx]
-            self.tail.batched_submit_put_task(
-                t_keys,
-                t_objs,
+        # ONE batched routing call (vs N per-chunk calls in the old
+        # design). For the common "all tail" / "all head" case this is
+        # O(1); only heterogeneous schemes pay O(num_chunks).
+        head_idx, tail_idx = route_kv_chunks(
+            eff_layer, eff_num_layers, num_chunks
+        )
+
+        # Fast path: 100% tail. Pass the caller's own keys / objs through
+        # — no list rebuild, no ``head`` call at all. This is the path
+        # used by the default ``route_kv_chunks`` (everything to tail)
+        # and the percentage-based schemes when this particular layer
+        # happens to send nothing to head.
+        if not head_idx:
+            return self.tail.batched_submit_put_task(
+                keys,
+                objs,
                 transfer_spec=transfer_spec,
                 on_complete_callback=on_complete_callback,
                 layer_id=layer_id,
@@ -192,41 +207,85 @@ class RouteDispatchBackend(StorageBackendInterface):
                 req_id=req_id,
             )
 
-        # Head side: stage (memcpy tail-pool → head-pool), then submit via
-        # the head backend. The head Mooncake Client has its head-pool MR
-        # on mlx5_0, so the RDMA WRITE uses mlx5_0.
-        if head_idx:
-            h_keys = [keys[i] for i in head_idx]
-            h_source_objs = [objs[i] for i in head_idx]
-            head_staged_objs = self._stage_to_head_pool(h_source_objs)
+        # Fast path: 100% head. Stage everything and submit via head.
+        # Skip the tail branch entirely.
+        if not tail_idx:
+            head_staged_objs = self._stage_to_head_pool(list(objs))
             if head_staged_objs is None:
-                # Staging failed — fall back to tail so we don't lose
-                # the chunk. This is a safety valve; the benchmark
-                # should not hit it.
                 logger.warning(
                     "Head pool staging failed for %d chunks, falling "
                     "back to tail path",
-                    len(head_idx),
+                    num_chunks,
                 )
-                self.tail.batched_submit_put_task(
-                    h_keys,
-                    h_source_objs,
+                return self.tail.batched_submit_put_task(
+                    keys,
+                    objs,
                     transfer_spec=transfer_spec,
                     on_complete_callback=on_complete_callback,
                     layer_id=layer_id,
                     num_layers=num_layers,
                     req_id=req_id,
                 )
-            else:
-                self.head.batched_submit_put_task(
-                    h_keys,
-                    head_staged_objs,
-                    transfer_spec=transfer_spec,
-                    on_complete_callback=on_complete_callback,
-                    layer_id=layer_id,
-                    num_layers=num_layers,
-                    req_id=req_id,
-                )
+            self.head.batched_submit_put_task(
+                keys,
+                head_staged_objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=on_complete_callback,
+                layer_id=layer_id,
+                num_layers=num_layers,
+                req_id=req_id,
+            )
+            return None
+
+        # Heterogeneous: split by index. Rebuilding two shorter lists
+        # here is still O(num_chunks) but we only pay for it when the
+        # routing function actually wants a mixed partition.
+        t_keys = [keys[i] for i in tail_idx]
+        t_objs = [objs[i] for i in tail_idx]
+        self.tail.batched_submit_put_task(
+            t_keys,
+            t_objs,
+            transfer_spec=transfer_spec,
+            on_complete_callback=on_complete_callback,
+            layer_id=layer_id,
+            num_layers=num_layers,
+            req_id=req_id,
+        )
+
+        # Head side: stage (memcpy tail-pool → head-pool), then submit
+        # via the head backend. The head Mooncake Client has its head-
+        # pool MR on mlx5_0, so the RDMA WRITE uses mlx5_0.
+        h_keys = [keys[i] for i in head_idx]
+        h_source_objs = [objs[i] for i in head_idx]
+        head_staged_objs = self._stage_to_head_pool(h_source_objs)
+        if head_staged_objs is None:
+            # Staging failed — fall back to tail so we don't lose the
+            # chunk. This is a safety valve; the benchmark should not
+            # hit it.
+            logger.warning(
+                "Head pool staging failed for %d chunks, falling back "
+                "to tail path",
+                len(head_idx),
+            )
+            self.tail.batched_submit_put_task(
+                h_keys,
+                h_source_objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=on_complete_callback,
+                layer_id=layer_id,
+                num_layers=num_layers,
+                req_id=req_id,
+            )
+        else:
+            self.head.batched_submit_put_task(
+                h_keys,
+                head_staged_objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=on_complete_callback,
+                layer_id=layer_id,
+                num_layers=num_layers,
+                req_id=req_id,
+            )
         return None
 
     def _stage_to_head_pool(
@@ -262,41 +321,58 @@ class RouteDispatchBackend(StorageBackendInterface):
         if self.head is None or not keys:
             return self.tail.batched_get_blocking(keys, num_layers=num_layers)
 
-        # Mirror the Put-path contract: always consult route_kv_chunk. If
-        # the key doesn't carry layer_id (non-layerwise mode), use 0 /
-        # num_layers=1 so the routing function still dispatches.
+        # Mirror the Put-path contract: ask route_kv_chunks for the same
+        # partition the producer used. If the key doesn't carry layer_id
+        # (non-layerwise mode), use 0 / num_layers=1 so the routing
+        # function still dispatches deterministically.
         layer_id = getattr(keys[0], "layer_id", None)
         eff_layer = layer_id if layer_id is not None else 0
         eff_num_layers = num_layers if num_layers > 0 else 1
-
         num_chunks = len(keys)
-        head_idx: list[int] = []
-        tail_idx: list[int] = []
-        for ci in range(num_chunks):
-            route = route_kv_chunk(eff_layer, ci, eff_num_layers, num_chunks)
-            if route == "head":
-                head_idx.append(ci)
-            else:
-                tail_idx.append(ci)
 
-        results: List[Optional[MemoryObj]] = [None] * num_chunks
+        head_idx, tail_idx = route_kv_chunks(
+            eff_layer, eff_num_layers, num_chunks
+        )
 
-        if tail_idx:
-            t_keys = [keys[i] for i in tail_idx]
-            t_objs = self.tail.batched_get_blocking(t_keys, num_layers=num_layers)
-            for i, idx in enumerate(tail_idx):
-                results[idx] = t_objs[i] if t_objs else None
+        # Fast path: all tail. Return the tail result unchanged.
+        if not head_idx:
+            return self.tail.batched_get_blocking(keys, num_layers=num_layers)
 
-        if head_idx:
-            h_keys = [keys[i] for i in head_idx]
-            h_objs_head_pool = self.head.batched_get_blocking(
-                h_keys, num_layers=num_layers
+        # Fast path: all head. Single head fetch + memcpy back to tail
+        # pool so StorageManager sees tail-owned MemoryObjs.
+        if not tail_idx:
+            h_objs = self.head.batched_get_blocking(
+                keys, num_layers=num_layers
             )
+            results: List[Optional[MemoryObj]] = [None] * num_chunks
+            if h_objs:
+                for i, h_obj in enumerate(h_objs):
+                    if h_obj is None:
+                        results[i] = None
+                    else:
+                        results[i] = self._copy_from_head_pool_to_tail(h_obj)
+                        h_obj.ref_count_down()
+            return results
+
+        # Heterogeneous: partition, fetch from each backend, merge.
+        results = [None] * num_chunks
+
+        t_keys = [keys[i] for i in tail_idx]
+        t_objs = self.tail.batched_get_blocking(t_keys, num_layers=num_layers)
+        if t_objs:
+            for i, idx in enumerate(tail_idx):
+                results[idx] = t_objs[i]
+
+        h_keys = [keys[i] for i in head_idx]
+        h_objs_head_pool = self.head.batched_get_blocking(
+            h_keys, num_layers=num_layers
+        )
+        if h_objs_head_pool:
             # Copy head-pool slots back to the tail pool so callers only
             # ever see tail-pool-owned MemoryObjs and can release them
             # via the allocator StorageManager knows about.
             for i, idx in enumerate(head_idx):
-                h_obj = h_objs_head_pool[i] if h_objs_head_pool else None
+                h_obj = h_objs_head_pool[i]
                 if h_obj is None:
                     results[idx] = None
                 else:
