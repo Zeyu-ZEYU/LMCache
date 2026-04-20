@@ -3,12 +3,8 @@
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
-import copy
 import threading
 import time
-
-# Third Party
-import yaml
 
 # First Party
 from lmcache.logging import init_logger
@@ -16,7 +12,6 @@ from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
-from lmcache.v1.kv_routing import route_kv_chunk
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
@@ -29,6 +24,13 @@ logger = init_logger(__name__)
 
 
 class RemoteBackend(StorageBackendInterface):
+    # Marker: StorageManager.batched_put passes layer_id / num_layers to any
+    # backend whose class advertises this attribute. RemoteBackend accepts
+    # them (ignored internally — they're needed only by the route-split
+    # wrapper, which also advertises this marker). Other backends like
+    # LocalCPUBackend / LocalDiskBackend don't and won't receive them.
+    accepts_route_kwargs = True
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -112,13 +114,6 @@ class RemoteBackend(StorageBackendInterface):
         # we must make decision (whether to send or not) at the local side
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-
-        # --- Head NIC splitting (lazy init to avoid port conflicts at startup) ---
-        self.head_connection: Optional[RemoteConnector] = None
-        self._head_nic_enabled = (
-            config.enable_head_nic_split and config.head_nic_config_file
-        )
-        self._head_nic_init_args = (config, metadata, loop, local_cpu_backend)
 
         # NOTE: Health monitoring is now handled at the LMCacheEngine level
         # through HealthMonitor. RemoteBackend no longer manages its own
@@ -236,58 +231,6 @@ class RemoteBackend(StorageBackendInterface):
             self._get_pending_per_req.pop(req_id, None)
             self._get_done_events.pop(req_id, None)
         return start_ts, end_ts
-
-    def _ensure_head_connection(self) -> Optional[RemoteConnector]:
-        """Lazy-init: create head NIC connector on first use."""
-        if self.head_connection is not None:
-            return self.head_connection
-        if not self._head_nic_enabled:
-            return None
-        self._init_head_nic_connector(*self._head_nic_init_args)
-        return self.head_connection
-
-    def _init_head_nic_connector(
-        self,
-        config: LMCacheEngineConfig,
-        metadata: LMCacheMetadata,
-        loop: asyncio.AbstractEventLoop,
-        local_cpu_backend: Optional[LocalCPUBackend],
-    ):
-        """Create a second Mooncake connector for head NIC (mlx5_0)."""
-        try:
-            with open(config.head_nic_config_file, "r") as f:
-                head_cfg = yaml.safe_load(f)
-
-            # Build a modified config for the head NIC connector
-            head_config = copy.copy(config)
-            head_url = head_cfg.get("remote_url", config.remote_url)
-            head_config.remote_url = head_url
-
-            # Override extra_config with head NIC params
-            head_extra = head_cfg.get("extra_config", {})
-            head_config.extra_config = head_extra
-
-            self.head_connection = CreateConnector(
-                head_url,
-                loop,
-                local_cpu_backend,
-                head_config,
-                metadata,
-            )
-            # Ensure head connector uses zero-copy (not put_parts).
-            # copy.copy of metaclass config may not propagate extra_config
-            # correctly, causing save_chunk_meta to default to wrong value.
-            inner = getattr(self.head_connection, "_connector", None)
-            if inner and hasattr(inner, "save_chunk_meta"):
-                inner.save_chunk_meta = False
-            logger.info(
-                "Head NIC connector initialized: url=%s device=%s",
-                head_url,
-                head_extra.get("device_name", "unknown"),
-            )
-        except Exception:
-            logger.exception("Failed to initialize head NIC connector")
-            self.head_connection = None
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -520,85 +463,27 @@ class RemoteBackend(StorageBackendInterface):
                             )
 
             # Extract preferred_segment for targeted RDMA WRITE to the
-            # decode node's own Mooncake segment. Tail and head are TWO
-            # separate segments on the same Mooncake master (different
-            # local_hostname per register):
-            #   tail = decode's IPv6 on mlx5_bond_* (transfer_spec
-            #          .receiver_rdma_host)
-            #   head = decode's IPv4 on mlx5_0 (transfer_spec.receiver_host,
-            #          which is the eth0 hostname the proxy already carries)
-            # Passing the wrong family to a connector yields a silent
-            # Mooncake NoSuchSegment failure, so they MUST be distinct.
-            tail_preferred_segment = None
-            head_preferred_segment = None
-            if transfer_spec is not None:
-                if hasattr(transfer_spec, "receiver_rdma_host"):
-                    tail_preferred_segment = getattr(
-                        transfer_spec, "receiver_rdma_host", None
-                    )
-                if hasattr(transfer_spec, "receiver_host"):
-                    head_preferred_segment = getattr(
-                        transfer_spec, "receiver_host", None
-                    )
-
-            tail_put_kwargs: dict = {}
-            if tail_preferred_segment:
-                tail_put_kwargs["preferred_segment"] = tail_preferred_segment
-
-            head_put_kwargs: dict = {}
-            if head_preferred_segment:
-                head_put_kwargs["preferred_segment"] = head_preferred_segment
-
-            # --- Head NIC routing (lazy init) ---
-            if (
-                self._head_nic_enabled
-                and layer_id is not None
-                and self._ensure_head_connection() is not None
+            # receiver's Mooncake segment. The `receiver_rdma_host` comes
+            # from the proxy's transfer_spec when PD overlap targets a
+            # specific decode node; it's the segment's local_hostname
+            # (IPv6 on mlx5_bond_* for the tail case). When not set,
+            # Mooncake picks a segment by free-space heuristic.
+            put_kwargs: dict = {}
+            if transfer_spec is not None and hasattr(
+                transfer_spec, "receiver_rdma_host"
             ):
-                num_chunks = len(keys)
-                head_idx = []
-                tail_idx = []
-                for ci in range(num_chunks):
-                    nic = route_kv_chunk(
-                        layer_id, ci, num_layers, num_chunks
-                    )
-                    if nic == "head":
-                        head_idx.append(ci)
-                    else:
-                        tail_idx.append(ci)
+                seg = getattr(transfer_spec, "receiver_rdma_host", None)
+                if seg:
+                    put_kwargs["preferred_segment"] = seg
 
-                if head_idx:
-                    h_keys = [keys[i] for i in head_idx]
-                    h_objs = [compressed_memory_objs[i] for i in head_idx]
-                    hf = asyncio.run_coroutine_threadsafe(
-                        self.head_connection.batched_put(
-                            h_keys, h_objs, **head_put_kwargs
-                        ),
-                        self.loop,
-                    )
-                    self._track_put_submit(req_id, hf)
-                    hf.add_done_callback(batched_done_callback)
-                if tail_idx:
-                    t_keys = [keys[i] for i in tail_idx]
-                    t_objs = [compressed_memory_objs[i] for i in tail_idx]
-                    tf = asyncio.run_coroutine_threadsafe(
-                        self.connection.batched_put(
-                            t_keys, t_objs, **tail_put_kwargs
-                        ),
-                        self.loop,
-                    )
-                    self._track_put_submit(req_id, tf)
-                    tf.add_done_callback(batched_done_callback)
-            else:
-                # Default: all chunks via tail (main connection)
-                future = asyncio.run_coroutine_threadsafe(
-                    self.connection.batched_put(
-                        keys, compressed_memory_objs, **tail_put_kwargs
-                    ),
-                    self.loop,
-                )
-                self._track_put_submit(req_id, future)
-                future.add_done_callback(batched_done_callback)
+            future = asyncio.run_coroutine_threadsafe(
+                self.connection.batched_put(
+                    keys, compressed_memory_objs, **put_kwargs
+                ),
+                self.loop,
+            )
+            self._track_put_submit(req_id, future)
+            future.add_done_callback(batched_done_callback)
         else:
             for key, memory_obj in zip(keys, memory_objs, strict=False):
                 self.submit_put_task(
@@ -661,25 +546,6 @@ class RemoteBackend(StorageBackendInterface):
     def put_failed_count(self):
         return self._put_failed_count
 
-    def _batched_get_from_connection(
-        self,
-        conn: RemoteConnector,
-        keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
-        """Helper: batched get from a specific connector."""
-        if conn.support_batched_get():
-            future = asyncio.run_coroutine_threadsafe(
-                conn.batched_get(keys), self.loop
-            )
-            try:
-                return future.result(self.config.blocking_timeout_secs)
-            except Exception as e:
-                if isinstance(e, TimeoutError):
-                    future.cancel()
-                logger.warning("_batched_get_from_connection error: %s", e)
-                return [None] * len(keys)
-        return [None] * len(keys)
-
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
@@ -703,47 +569,7 @@ class RemoteBackend(StorageBackendInterface):
 
         t1 = time.perf_counter()
 
-        # --- Head NIC routing for retrieve (lazy init) ---
-        if self._head_nic_enabled and keys and self._ensure_head_connection() is not None:
-            layer_id = getattr(keys[0], "layer_id", None)
-            if layer_id is not None:
-                num_chunks = len(keys)
-                head_idx = []
-                tail_idx = []
-                for ci in range(num_chunks):
-                    nic = route_kv_chunk(
-                        layer_id, ci, num_layers, num_chunks
-                    )
-                    if nic == "head":
-                        head_idx.append(ci)
-                    else:
-                        tail_idx.append(ci)
-
-                if head_idx and not tail_idx:
-                    # All head — retrieve from head connector
-                    return self._batched_get_from_connection(
-                        self.head_connection, keys
-                    )
-                elif tail_idx and not head_idx:
-                    pass  # Fall through to normal path
-                elif head_idx and tail_idx:
-                    # Mixed: query both, merge results
-                    results: list[Optional[MemoryObj]] = [None] * num_chunks
-                    h_keys = [keys[i] for i in head_idx]
-                    t_keys = [keys[i] for i in tail_idx]
-                    h_objs = self._batched_get_from_connection(
-                        self.head_connection, h_keys
-                    )
-                    t_objs = self._batched_get_from_connection(
-                        self.connection, t_keys
-                    )
-                    for i, idx in enumerate(head_idx):
-                        results[idx] = h_objs[i] if h_objs else None
-                    for i, idx in enumerate(tail_idx):
-                        results[idx] = t_objs[i] if t_objs else None
-                    return results
-
-        # batched get (default: tail only)
+        # batched get
         if self.connection.support_batched_get():
             future = asyncio.run_coroutine_threadsafe(
                 self.connection.batched_get(keys), self.loop

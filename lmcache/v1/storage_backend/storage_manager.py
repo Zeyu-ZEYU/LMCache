@@ -424,12 +424,11 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            # Only pass layer_id/num_layers/req_id to backends that support
-            # them (RemoteBackend for head NIC routing + per-request Put
-            # completion tracking). Other backends like LocalCPUBackend
-            # don't accept these kwargs.
+            # Pass layer_id/num_layers/req_id only to backends that accept
+            # them (RemoteBackend and the route-split wrapper). Local
+            # backends like LocalCPUBackend don't accept these kwargs.
             put_kwargs: dict = {"transfer_spec": transfer_spec}
-            if layer_id is not None and hasattr(backend, "head_connection"):
+            if layer_id is not None and hasattr(backend, "accepts_route_kwargs"):
                 put_kwargs["layer_id"] = layer_id
                 put_kwargs["num_layers"] = num_layers
             if req_id is not None and hasattr(backend, "wait_put_done"):

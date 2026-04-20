@@ -39,6 +39,92 @@ def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
     return metadata.role != "scheduler" and torch.cuda.is_available()
 
 
+def _build_head_remote_backend(
+    config: LMCacheEngineConfig,
+    metadata: LMCacheMetadata,
+    loop: asyncio.AbstractEventLoop,
+    dst_device: str,
+    lmcache_worker: Optional["LMCacheWorker"] = None,
+) -> Optional["RemoteBackend"]:
+    """Construct a second RemoteBackend bound to the head NIC (mlx5_0).
+
+    The head backend is **fully independent** of the tail: it has its
+    own private :class:`LocalCPUBackend` with its own pinned CPU pool,
+    which the head Mooncake Client registers with mlx5_0 only. This
+    avoids the MR-conflict class of bugs that arise from sharing a
+    single pinned VA range across two RDMA Protection Domains.
+
+    The head config is cloned from ``config`` with these overrides:
+
+    * ``remote_url``, ``extra_config`` ← loaded from
+      ``config.head_nic_config_file`` (YAML)
+    * ``max_local_cpu_size`` ← ``extra_config.head_local_cpu_size_gb``
+      (default 4 GB) so the head pool is modest, not a full cache tier
+
+    Returns ``None`` on failure so the caller can fall back cleanly.
+    """
+    # Standard
+    import copy
+
+    # Third Party
+    import yaml
+
+    try:
+        with open(config.head_nic_config_file, "r") as f:
+            head_cfg_yaml = yaml.safe_load(f) or {}
+    except Exception:
+        logger.exception(
+            "Failed to read head_nic_config_file=%s",
+            config.head_nic_config_file,
+        )
+        return None
+
+    head_config = copy.copy(config)
+    head_remote_url = head_cfg_yaml.get("remote_url", config.remote_url)
+    head_config.remote_url = head_remote_url
+    head_extra = head_cfg_yaml.get("extra_config", {}) or {}
+    head_config.extra_config = head_extra
+
+    # Pool size for the head-side pinned CPU buffer. Small by default —
+    # only needs to stage chunks being RDMA'd via mlx5_0.
+    head_pool_gb = float(head_extra.get("head_local_cpu_size_gb", 4.0))
+    head_config.max_local_cpu_size = head_pool_gb
+    # Head pool is staging-only, not a cache tier: force local_cpu off
+    # so LocalCPUBackend doesn't use it as a hot cache.
+    head_config.local_cpu = False
+    # Avoid rpc_port / instance_id collisions with the tail backend.
+    if getattr(config, "lmcache_instance_id", None) is not None:
+        head_config.lmcache_instance_id = config.lmcache_instance_id + "_head"
+
+    # Dedicated LocalCPUBackend for the head's private pool.
+    head_local_cpu_backend = LocalCPUBackend(
+        head_config,
+        metadata,
+        dst_device,
+        lmcache_worker,
+    )
+
+    try:
+        head_remote_backend = RemoteBackend(
+            head_config,
+            metadata,
+            loop,
+            head_local_cpu_backend,
+            dst_device,
+        )
+    except Exception:
+        logger.exception("Failed to construct head RemoteBackend")
+        return None
+
+    logger.info(
+        "Head RemoteBackend initialized: url=%s device=%s pool=%.1f GB",
+        head_remote_url,
+        head_extra.get("device_name", "unknown"),
+        head_pool_gb,
+    )
+    return head_remote_backend
+
+
 def storage_plugin_launcher(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
@@ -230,8 +316,47 @@ def CreateStorageBackends(
             local_cpu_backend,
             dst_device,
         )
-        backend_name = str(remote_backend)
-        storage_backends[backend_name] = remote_backend
+
+        # Optional: wrap with RouteDispatchBackend when KV head-NIC split is
+        # enabled. This creates a second, private RemoteBackend with its
+        # own LocalCPUBackend (small pool registered with the head RNIC).
+        # The wrapper routes each KV chunk to tail or head per
+        # route_kv_chunk(layer_id, chunk_id, ...).
+        #
+        # When enable_head_nic_split is False the primary RemoteBackend is
+        # used directly — this path is bit-equivalent to dev.
+        if (
+            config.enable_head_nic_split
+            and config.head_nic_config_file
+            and metadata.role != "scheduler"
+        ):
+            # First Party
+            from lmcache.v1.storage_backend.route_dispatch_backend import (
+                RouteDispatchBackend,
+            )
+
+            head_remote_backend = _build_head_remote_backend(
+                config, metadata, loop, dst_device, lmcache_worker
+            )
+            if head_remote_backend is not None:
+                wrapped = RouteDispatchBackend(
+                    tail_backend=remote_backend,
+                    head_backend=head_remote_backend,
+                )
+                # Use the wrapper in place of the raw tail backend so
+                # StorageManager dispatches through it transparently.
+                backend_name = str(wrapped)
+                storage_backends[backend_name] = wrapped
+            else:
+                logger.warning(
+                    "enable_head_nic_split was True but head backend "
+                    "construction failed; falling back to tail-only"
+                )
+                backend_name = str(remote_backend)
+                storage_backends[backend_name] = remote_backend
+        else:
+            backend_name = str(remote_backend)
+            storage_backends[backend_name] = remote_backend
 
     if not config.enable_pd or config.local_cpu:
         # Load storage backends from configuration
