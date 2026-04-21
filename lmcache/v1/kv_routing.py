@@ -95,9 +95,9 @@ def route_kv_chunks(
         return [], list(range(num_chunks))
     """
     # EXPERIMENT (preferred_segment=local fixed, no-overlap): route 100% of
-    # chunks to tail so every Put goes through the tail RemoteBackend. Pairs
-    # with the subsequent all-head run to compare head vs tail with all cross-
+    # chunks to head so every Put goes through the head RemoteBackend. Pairs
+    # with the preceding all-tail run to compare head vs tail with all cross-
     # node RDMA WRITE removed (preferred_segment=local for both).
-    #     all-head swap:
-    #         return list(range(num_chunks)), []
-    return [], list(range(num_chunks))
+    #     all-tail swap:
+    #         return [], list(range(num_chunks))
+    return list(range(num_chunks)), []
