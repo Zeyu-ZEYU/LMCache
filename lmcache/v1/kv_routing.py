@@ -94,11 +94,11 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (route-aware allocate, no-overlap):
-    # route 100% of chunks to head to measure the effect of skipping
-    # the tail→head staging memcpy. Pairs with the preceding all-tail
-    # run (same no-overlap, sequential c=1) to isolate how much of the
-    # head path cost comes from the staging copy vs the mlx5_0 NIC.
-    #     all-tail swap:
-    #         return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # EXPERIMENT (route-aware Get, no-overlap):
+    # route 100% of chunks to tail to confirm the Get-path staging
+    # elimination (commit caa32f0) didn't regress the all-tail fast
+    # path (head_idx=[] → self.tail.batched_get_blocking directly,
+    # same shape as before and as dev).
+    #     all-head swap:
+    #         return list(range(num_chunks)), []
+    return [], list(range(num_chunks))
