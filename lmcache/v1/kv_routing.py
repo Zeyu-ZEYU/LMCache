@@ -94,7 +94,10 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT: route 100% of chunks to head (for put_diag root cause probe).
-    # For the "all tail" experiment, swap to:
-    #     return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # EXPERIMENT (preferred_segment=local fixed, no-overlap): route 100% of
+    # chunks to tail so every Put goes through the tail RemoteBackend. Pairs
+    # with the subsequent all-head run to compare head vs tail with all cross-
+    # node RDMA WRITE removed (preferred_segment=local for both).
+    #     all-head swap:
+    #         return list(range(num_chunks)), []
+    return [], list(range(num_chunks))
