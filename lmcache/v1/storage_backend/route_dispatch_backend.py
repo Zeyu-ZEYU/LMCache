@@ -162,7 +162,22 @@ class RouteDispatchBackend(StorageBackendInterface):
         layer_id: Optional[int] = None,
         num_layers: int = 0,
         req_id: Optional[str] = None,
+        pre_routed: bool = False,
     ) -> Union[List[Future], None]:
+        """
+        :param pre_routed: If True, the caller (cache_engine) has already
+            allocated each MemoryObj from the correct pool per
+            :func:`route_kv_chunks`: head-routed chunks live in head's
+            pinned pool, tail-routed in tail's. In that case the head-side
+            ``_stage_to_head_pool`` memcpy is redundant and we pass the
+            objs through directly, saving ~0.5–1 ms per chunk of CPU→CPU
+            copy on the hot path. Caller MUST use the same
+            ``route_kv_chunks(layer_id, num_layers, num_chunks)`` partition
+            we use here; for all-tail / all-head routes (the common
+            production case) the partition is length-invariant so
+            caller and backend always agree. For future heterogeneous
+            routes callers need to ensure num_chunks matches.
+        """
         # Bypass when head-split isn't wired up at all.
         if self.head is None:
             return self.tail.batched_submit_put_task(
@@ -207,9 +222,22 @@ class RouteDispatchBackend(StorageBackendInterface):
                 req_id=req_id,
             )
 
-        # Fast path: 100% head. Stage everything and submit via head.
-        # Skip the tail branch entirely.
+        # Fast path: 100% head. If the caller pre-allocated from head
+        # pool (pre_routed=True), submit directly — no staging. Else
+        # stage everything via tail→head memcpy as before.
         if not tail_idx:
+            if pre_routed:
+                self.head.batched_submit_put_task(
+                    keys,
+                    objs,
+                    transfer_spec=transfer_spec,
+                    on_complete_callback=on_complete_callback,
+                    layer_id=layer_id,
+                    num_layers=num_layers,
+                    req_id=req_id,
+                )
+                return None
+
             head_staged_objs = self._stage_to_head_pool(list(objs))
             if head_staged_objs is None:
                 logger.warning(
@@ -252,11 +280,25 @@ class RouteDispatchBackend(StorageBackendInterface):
             req_id=req_id,
         )
 
-        # Head side: stage (memcpy tail-pool → head-pool), then submit
-        # via the head backend. The head Mooncake Client has its head-
+        # Head side: either take the pre-allocated head-pool objs
+        # directly (pre_routed=True), or stage (memcpy tail-pool →
+        # head-pool) as before. The head Mooncake Client has its head-
         # pool MR on mlx5_0, so the RDMA WRITE uses mlx5_0.
         h_keys = [keys[i] for i in head_idx]
         h_source_objs = [objs[i] for i in head_idx]
+
+        if pre_routed:
+            self.head.batched_submit_put_task(
+                h_keys,
+                h_source_objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=on_complete_callback,
+                layer_id=layer_id,
+                num_layers=num_layers,
+                req_id=req_id,
+            )
+            return None
+
         head_staged_objs = self._stage_to_head_pool(h_source_objs)
         if head_staged_objs is None:
             # Staging failed — fall back to tail so we don't lose the

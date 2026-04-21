@@ -54,6 +54,10 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.kv_routing import route_kv_chunks
+from lmcache.v1.storage_backend.route_dispatch_backend import (
+    RouteDispatchBackend,
+)
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -455,30 +459,107 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        # Route-aware allocation (no-overlap path).
+        #
+        # When ``RouteDispatchBackend`` with a live head backend is in use,
+        # pre-compute the per-chunk route and allocate head-bound chunks
+        # directly from the head pinned pool (via head.get_allocator_backend())
+        # instead of the default tail pool. This eliminates the subsequent
+        # tail→head ``_stage_to_head_pool`` ctypes.memmove that the route
+        # wrapper otherwise does before handing the chunks to the head
+        # Mooncake Client — a saving of ~0.5–1 ms per 24 MB chunk, which
+        # dominates ~30% of d_kv_mnck_in on the head path at 8000-token
+        # inputs in our bench.
+        #
+        # Implementation note: ``route_kv_chunks`` needs ``num_chunks`` up
+        # front. We materialize the token_database output into a list once
+        # (cheap; typical chunk count is < 100) so the route decision is
+        # deterministic for the final allocation set. For non-heterogeneous
+        # routes (all-tail / all-head) the partition is length-invariant,
+        # so a truncated allocation still agrees with what the wrapper
+        # re-derives at put time.
+        route_backend: Optional[RouteDispatchBackend] = None
+        head_allocator = None
+        head_idx_set: set = set()
+        use_route_aware_alloc = False
+        chunk_plan: Optional[list] = None
+
+        for _b in self.storage_manager.storage_backends.values():
+            if isinstance(_b, RouteDispatchBackend) and _b.head is not None:
+                route_backend = _b
+                break
+        if route_backend is not None:
+            chunk_plan = list(
+                self.token_database.process_tokens(
+                    tokens,
+                    hashes,
+                    offsets,
+                    mask,
+                    request_configs=request_configs,
+                )
+            )
+            num_chunks_total = len(chunk_plan)
+            if num_chunks_total > 0:
+                # Non-overlap: synthetic (layer_id=0, num_layers=1).
+                # This is the same (eff_layer, eff_num_layers) the
+                # RouteDispatchBackend wrapper will use at put time
+                # when layer_id is not threaded through.
+                _head_idx, _tail_idx = route_kv_chunks(0, 1, num_chunks_total)
+                head_idx_set = set(_head_idx)
+                if head_idx_set:
+                    head_allocator = route_backend.head.get_allocator_backend()
+                    use_route_aware_alloc = True
+
         with store_stats.profile_process_tokens():
             prev_key = 0
-            for start, end, key in self.token_database.process_tokens(
-                tokens,
-                hashes,
-                offsets,
-                mask,
-                request_configs=request_configs,
-            ):
+            token_iter = (
+                enumerate(chunk_plan)
+                if chunk_plan is not None
+                else enumerate(
+                    self.token_database.process_tokens(
+                        tokens,
+                        hashes,
+                        offsets,
+                        mask,
+                        request_configs=request_configs,
+                    )
+                )
+            )
+            for i, (start, end, key) in token_iter:
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
                 kv_shapes = self.metadata.get_shapes(num_tokens)
                 kv_dtypes = self.metadata.get_dtypes()
 
-                # TODO (Jiayi): should be batched in the future
-                memory_obj = self.storage_manager.allocate(
-                    kv_shapes,
-                    kv_dtypes,
-                    busy_loop=self.config.get_extra_config_value(
-                        "force_store_wait", False
-                    ),
-                    fmt=self.fmt,
+                busy_loop = self.config.get_extra_config_value(
+                    "force_store_wait", False
                 )
+                if (
+                    use_route_aware_alloc
+                    and head_allocator is not None
+                    and i in head_idx_set
+                ):
+                    # Route-aware path: allocate directly from head pool
+                    # so this chunk's GPU→CPU memcpy (via batched_from_gpu
+                    # below) lands in head's pinned buffer (mlx5_0 MR),
+                    # ready for head Mooncake Client's batch_put_from
+                    # with zero additional CPU memcpy.
+                    memory_obj = head_allocator.allocate(
+                        kv_shapes,
+                        kv_dtypes,
+                        fmt=self.fmt,
+                        eviction=True,
+                        busy_loop=busy_loop,
+                    )
+                else:
+                    # TODO (Jiayi): should be batched in the future
+                    memory_obj = self.storage_manager.allocate(
+                        kv_shapes,
+                        kv_dtypes,
+                        busy_loop=busy_loop,
+                        fmt=self.fmt,
+                    )
                 if memory_obj is None:
                     logger.warning(
                         "Local cpu memory under pressure so"
@@ -542,6 +623,7 @@ class LMCacheEngine:
                 transfer_spec=transfer_spec,
                 location=self.store_location,
                 req_id=req_id,
+                pre_routed=use_route_aware_alloc,
             )
 
         self.stats_monitor.on_store_finished(

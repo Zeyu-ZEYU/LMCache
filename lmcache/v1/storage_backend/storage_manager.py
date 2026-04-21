@@ -385,12 +385,20 @@ class StorageManager:
         layer_id: Optional[int] = None,
         num_layers: int = 0,
         req_id: Optional[str] = None,
+        pre_routed: bool = False,
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        :param pre_routed: If True, the caller has already allocated each
+            memory_obj in its route-correct pool (tail pool for tail-bound
+            chunks, head pool for head-bound chunks) per ``route_kv_chunks``.
+            The flag is forwarded to backends that advertise
+            ``accepts_route_kwargs`` (i.e. RouteDispatchBackend), letting
+            them skip the tail→head staging memcpy on head-routed chunks.
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
@@ -433,6 +441,11 @@ class StorageManager:
                 put_kwargs["num_layers"] = num_layers
             if req_id is not None and hasattr(backend, "wait_put_done"):
                 put_kwargs["req_id"] = req_id
+            # Only RouteDispatchBackend (accepts_route_kwargs=True)
+            # understands the pre_routed flag; passing it to anyone else
+            # would TypeError.
+            if pre_routed and hasattr(backend, "accepts_route_kwargs"):
+                put_kwargs["pre_routed"] = True
             backend.batched_submit_put_task(ks, objs, **put_kwargs)
 
         for cname, (ks, objs) in obj_dict.items():
