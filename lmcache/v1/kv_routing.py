@@ -94,7 +94,7 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT: route 100% of chunks to head (Mode C).
-    # For the "all tail" experiment, swap to:
-    #     return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # EXPERIMENT: route 100% of chunks to tail (Mode B' NIC counter probe).
+    # For the "all head" experiment, swap to:
+    #     return list(range(num_chunks)), []
+    return [], list(range(num_chunks))
