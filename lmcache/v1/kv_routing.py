@@ -94,11 +94,11 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (route-aware Get, no-overlap):
-    # route 100% of chunks to tail to confirm the Get-path staging
-    # elimination (commit caa32f0) didn't regress the all-tail fast
-    # path (head_idx=[] → self.tail.batched_get_blocking directly,
-    # same shape as before and as dev).
-    #     all-head swap:
-    #         return list(range(num_chunks)), []
-    return [], list(range(num_chunks))
+    # EXPERIMENT (MC_SLICE_SIZE=1MB, no-overlap):
+    # route 100% of chunks to head to see if the bigger per-op slice
+    # size (64 KB → 1 MB, commit 1e2b0e416 in vLLM repo) materially
+    # changes the head RDMA throughput — specifically whether the
+    # per-op fixed overhead component in d_kv_mnck_out drops.
+    #     all-tail swap:
+    #         return [], list(range(num_chunks))
+    return list(range(num_chunks)), []
