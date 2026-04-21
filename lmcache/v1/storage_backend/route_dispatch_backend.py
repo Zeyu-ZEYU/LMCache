@@ -33,26 +33,42 @@ its private ``LocalCPUBackend`` → private pinned pool → private MR, each
 registered with exactly one device. The wrapper below routes chunks per
 :func:`route_kv_chunks` and dispatches to the appropriate backend.
 
-Memory flow
------------
-StorageManager allocates chunks from the *tail* backend's allocator (the
-wrapper's ``get_allocator_backend()`` returns the tail allocator). When a
-chunk is routed to head:
+Memory flow (current, staging-free on both Put and Get)
+-------------------------------------------------------
 
-* **Put**:   memcpy  tail-pool slot  →  head-pool staging slot, then
-             ``head_backend.batched_submit_put_task`` uses that staging
-             slot as the RDMA WRITE source. Head pool & head Client are
-             registered with mlx5_0 only — no MR conflict.
+We mirror upstream dev's shape per-route: each underlying RemoteBackend
+owns its own ``LocalCPUBackend`` pool, Puts allocate + RDMA WRITE from
+that pool, Gets allocate + RDMA READ into that pool, and the resulting
+``MemoryObj`` flows to/from the GPU via ``gpu_connector`` without any
+cross-pool staging. Downstream (``gpu_connector.batched_from_gpu`` /
+``batched_to_gpu``, ``ref_count_down``) is per-obj and pool-agnostic,
+which is exactly how dev's single-pool setup already implicitly relies
+on things.
 
-* **Get**:   ``head_backend.batched_get_blocking`` fills a slot in the
-             head pool, then memcpy  head-pool slot  →  tail-pool slot
-             and return the tail slot. The head slot is released.
+* **Put**:   Caller (``cache_engine.store``) runs ``route_kv_chunks``
+             up-front and allocates head-bound chunks from
+             ``self.head.get_allocator_backend()``. The subsequent
+             ``gpu_connector.batched_from_gpu`` lands each chunk in
+             its correct pool in one pass. When ``batched_submit_put_task``
+             receives ``pre_routed=True`` it skips the legacy
+             ``_stage_to_head_pool`` tail→head memcpy and submits the
+             head-pool objs directly to ``self.head`` for RDMA WRITE.
+             (See commit 9d16320.)
 
-The memcpy cost (~0.5–1 ms per 24 MB chunk on a modern CPU) is the
-price paid for keeping two clean, independent RDMA MRs. If this overhead
-shows up in benchmarks we can later route allocation itself instead
-of copying — but for correctness-first this is the simplest working
-shape.
+* **Get**:   Each branch of ``batched_get_blocking`` calls its own
+             underlying backend and returns what that backend returns —
+             head-pool objs from ``self.head``, tail-pool objs from
+             ``self.tail``. No memcpy back to a "canonical" pool. The
+             resulting (possibly mixed-pool) list is consumed per-obj
+             by ``cache_engine.retrieve`` → ``gpu_connector.batched_to_gpu``,
+             which only reads ``memory_obj.tensor`` and is therefore
+             insensitive to pool membership.
+
+Legacy fallback: ``_stage_to_head_pool`` is kept for the ``pre_routed=
+False`` Put path (e.g. the layerwise / overlap code paths that have not
+yet been converted). A staging-free ``Get`` has no legacy fallback —
+there's nothing to fall back to because the head backend's
+``batched_get_blocking`` already allocates in its own pool.
 
 route_kv_chunks agreement between producer / consumer
 -----------------------------------------------------
@@ -360,6 +376,45 @@ class RouteDispatchBackend(StorageBackendInterface):
         keys: List[CacheEngineKey],
         num_layers: int = 0,
     ) -> List[Optional[MemoryObj]]:
+        """
+        Return per-key MemoryObjs in their native pool — no cross-pool
+        staging copy. This mirrors upstream dev's single-backend shape,
+        where ``RemoteBackend.batched_get_blocking`` returns MemoryObjs
+        allocated in whichever ``local_cpu_backend`` the remote was
+        constructed with, and the caller (``cache_engine.retrieve`` →
+        ``gpu_connector.batched_to_gpu``) consumes them per-obj without
+        any assumption about which pool they belong to.
+
+        Semantic alignment with dev:
+          * tail route → tail backend's pool → up to GPU (same as dev)
+          * head route → head backend's pool → up to GPU (new; was
+            previously memcpy'd to tail pool first, which is the
+            mirror-image of the Put-path ``_stage_to_head_pool`` that
+            we eliminated in commit 9d16320)
+
+        For heterogeneous routes the returned list is *mixed-pool*:
+        tail indices point to tail-pool objs, head indices to head-pool
+        objs. Downstream handles this uniformly because:
+
+          1. ``gpu_connector.batched_to_gpu`` iterates per-obj and reads
+             only ``memory_obj.tensor`` (``VLLMPagedMemGPUConnectorV2
+             .to_gpu`` at ``gpu_connectors.py:284, 319``). The H2D DMA
+             doesn't care which pool the pinned tensor lives in.
+          2. Per-obj ``ref_count_down`` returns each MemoryObj to its
+             own ``parent_allocator.free``, so tail-pool objs go back
+             to tail, head-pool objs go back to head — no leak, no
+             cross-pool free.
+          3. ``storage_manager.batched_get``'s hot-cache write-back
+             (``storage_manager.py:514-518``) is a no-op under our
+             ``local_cpu: False`` config (``local_cpu_backend.py:193-194``).
+             Even if enabled it only stashes refs in a dict keyed by
+             CacheEngineKey — no pool-specific manipulation of
+             ``.tensor``.
+
+        Skipping the stage saves ~0.5–1 ms per 24 MB chunk of CPU→CPU
+        memcpy on the decode side, symmetrically mirroring the Put-path
+        optimization.
+        """
         if self.head is None or not keys:
             return self.tail.batched_get_blocking(keys, num_layers=num_layers)
 
@@ -376,28 +431,20 @@ class RouteDispatchBackend(StorageBackendInterface):
             eff_layer, eff_num_layers, num_chunks
         )
 
-        # Fast path: all tail. Return the tail result unchanged.
+        # Fast path: all tail. Return the tail result unchanged — this
+        # branch already matched dev's shape (tail backend's pool =
+        # dev's single pool, semantically).
         if not head_idx:
             return self.tail.batched_get_blocking(keys, num_layers=num_layers)
 
-        # Fast path: all head. Single head fetch + memcpy back to tail
-        # pool so StorageManager sees tail-owned MemoryObjs.
+        # Fast path: all head. Return head-pool objs directly. Matches
+        # dev's shape on the head backend's private pool.
         if not tail_idx:
-            h_objs = self.head.batched_get_blocking(
-                keys, num_layers=num_layers
-            )
-            results: List[Optional[MemoryObj]] = [None] * num_chunks
-            if h_objs:
-                for i, h_obj in enumerate(h_objs):
-                    if h_obj is None:
-                        results[i] = None
-                    else:
-                        results[i] = self._copy_from_head_pool_to_tail(h_obj)
-                        h_obj.ref_count_down()
-            return results
+            return self.head.batched_get_blocking(keys, num_layers=num_layers)
 
-        # Heterogeneous: partition, fetch from each backend, merge.
-        results = [None] * num_chunks
+        # Heterogeneous: fetch each partition from its own backend and
+        # merge. Result list is mixed-pool (see method docstring above).
+        results: List[Optional[MemoryObj]] = [None] * num_chunks
 
         t_keys = [keys[i] for i in tail_idx]
         t_objs = self.tail.batched_get_blocking(t_keys, num_layers=num_layers)
@@ -406,53 +453,22 @@ class RouteDispatchBackend(StorageBackendInterface):
                 results[idx] = t_objs[i]
 
         h_keys = [keys[i] for i in head_idx]
-        h_objs_head_pool = self.head.batched_get_blocking(
-            h_keys, num_layers=num_layers
-        )
-        if h_objs_head_pool:
-            # Copy head-pool slots back to the tail pool so callers only
-            # ever see tail-pool-owned MemoryObjs and can release them
-            # via the allocator StorageManager knows about.
+        h_objs = self.head.batched_get_blocking(h_keys, num_layers=num_layers)
+        if h_objs:
             for i, idx in enumerate(head_idx):
-                h_obj = h_objs_head_pool[i]
-                if h_obj is None:
-                    results[idx] = None
-                else:
-                    results[idx] = self._copy_from_head_pool_to_tail(h_obj)
-                    # Release the head-pool slot regardless of copy outcome.
-                    h_obj.ref_count_down()
+                results[idx] = h_objs[i]
 
         return results
-
-    def _copy_from_head_pool_to_tail(self, h_obj: MemoryObj) -> Optional[MemoryObj]:
-        tail_alloc = self.tail.get_allocator_backend()
-        slot = tail_alloc.allocate(
-            h_obj.get_shape(),
-            h_obj.get_dtype(),
-            fmt=h_obj.meta.fmt,
-            eviction=True,
-        )
-        if slot is None:
-            logger.warning(
-                "Failed to allocate tail-pool slot to copy from head pool"
-            )
-            return None
-        ctypes.memmove(slot.data_ptr, h_obj.data_ptr, h_obj.get_size())
-        return slot
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         # Try tail first (default path). If head is configured and tail
         # misses, the key might have been Put via head for some layer —
-        # try head and copy back.
+        # try head and return its pool's obj directly (no staging copy;
+        # see ``batched_get_blocking`` docstring for why this is safe).
         obj = self.tail.get_blocking(key)
         if obj is not None or self.head is None:
             return obj
-        h_obj = self.head.get_blocking(key)
-        if h_obj is None:
-            return None
-        result = self._copy_from_head_pool_to_tail(h_obj)
-        h_obj.ref_count_down()
-        return result
+        return self.head.get_blocking(key)
 
     def get_non_blocking(
         self,
