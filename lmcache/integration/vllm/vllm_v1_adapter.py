@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import json
 import os
@@ -1487,13 +1487,35 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
+            # Non-overlap path: strip `receiver_rdma_host` before the
+            # engine forwards the spec to the Mooncake remote backend.
+            #
+            # Rationale: `receiver_rdma_host` was added for the KV-overlap
+            # experiment (commit 30e050e) so prefill's per-Put RDMA WRITE
+            # targets decode's Mooncake segment directly, allowing the Put
+            # to overlap with the remaining forward-pass compute. In
+            # no-overlap we call this `store()` only once, AFTER prefill
+            # forward finishes — there is no compute left to overlap with,
+            # so forcing preferred_segment=decode_IP just shifts wall-clock
+            # time from d_kv_mnck_out (decode Get) to d_kv_mnck_in (prefill
+            # Put) without any end-to-end benefit, and inflates the Put-side
+            # measurement in a way that obscures the per-NIC bandwidth
+            # comparison. Upstream LMCache `dev` leaves preferred_segment at
+            # its init-time value (= local hostname if
+            # `mooncake_prefer_local_alloc=true`, else master's free-space
+            # pick); here we match that by nulling out the per-Put override.
+            no_overlap_spec = (
+                replace(request.disagg_spec, receiver_rdma_host=None)
+                if request.disagg_spec is not None
+                else None
+            )
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
                 offset=skip_leading_tokens,
-                transfer_spec=request.disagg_spec,
+                transfer_spec=no_overlap_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
