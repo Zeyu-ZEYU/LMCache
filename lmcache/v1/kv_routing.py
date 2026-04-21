@@ -94,5 +94,6 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # Default: everything via tail. Constant-time regardless of num_chunks.
-    return [], list(range(num_chunks))
+    # EXPERIMENT: route 100% of chunks to head.
+    # Previously: return [], list(range(num_chunks))  # default all-tail
+    return list(range(num_chunks)), []
