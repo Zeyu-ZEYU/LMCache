@@ -94,10 +94,11 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (preferred_segment=local fixed, no-overlap): route 100% of
-    # chunks to head so every Put goes through the head RemoteBackend. Pairs
-    # with the preceding all-tail run to compare head vs tail with all cross-
-    # node RDMA WRITE removed (preferred_segment=local for both).
-    #     all-tail swap:
-    #         return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # EXPERIMENT (multi-conc, preferred_segment=local fixed, no-overlap):
+    # route 100% of chunks to tail for the multi-concurrency baseline.
+    # Pairs with the preceding all-head run (same c=4/c=8 at input=4096)
+    # to measure whether tail's 4×bonded advantage persists under MoE
+    # contention.
+    #     all-head swap:
+    #         return list(range(num_chunks)), []
+    return [], list(range(num_chunks))
