@@ -605,6 +605,33 @@ class MooncakestoreConnector(RemoteConnector):
             replica_cfg.replica_num = self.replica_config.replica_num
             replica_cfg.preferred_segment = preferred_segment
 
+        # DIAGNOSTIC: log what preferred_segment we're actually sending on
+        # each Put, and what the store reports as our own hostname. If
+        # these don't match (or the segment is empty-string), master will
+        # not honor the local-alloc hint and may cross-assign puts.
+        # Controlled via env var so it's easy to turn off.
+        if os.environ.get("LMCACHE_LOG_PUT_SEGMENT", "").lower() in (
+            "1", "true", "yes"
+        ):
+            try:
+                own_hostname = self.store.get_hostname()
+            except Exception:
+                own_hostname = "<get_hostname failed>"
+            pref_seg = getattr(replica_cfg, "preferred_segment", None)
+            pref_seg_repr = repr(pref_seg) if pref_seg is not None else "<None>"
+            logger.info(
+                "[put_diag] batch_put_from: device=%s master=%s "
+                "preferred_segment=%s own_hostname=%s match=%s n_keys=%d "
+                "total_bytes=%d",
+                self.config.device_name,
+                self.config.master_server_address,
+                pref_seg_repr,
+                repr(own_hostname),
+                (pref_seg == own_hostname),
+                len(key_strs),
+                sum(buffer_sizes),
+            )
+
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -620,6 +647,50 @@ class MooncakestoreConnector(RemoteConnector):
             logger.warning(
                 "Timeout during batch_put_from; some decoders may redo prefill."
             )
+
+        # DIAGNOSTIC: after the Put returns, query master for the actual
+        # segment each replica landed on. Compare to preferred_segment /
+        # own_hostname to see if master honored local-alloc. Gated by env
+        # var since this adds an extra RPC per Put batch.
+        if os.environ.get("LMCACHE_LOG_PUT_SEGMENT", "").lower() in (
+            "1", "true", "yes"
+        ) and key_strs:
+            try:
+                own_hostname = self.store.get_hostname()
+            except Exception:
+                own_hostname = "<get_hostname failed>"
+            pref_seg = getattr(replica_cfg, "preferred_segment", None)
+            try:
+                # Sample the first few keys; querying all would be noisy.
+                sample_n = min(3, len(key_strs))
+                descs = self.store.batch_get_replica_desc(
+                    key_strs[:sample_n]
+                )
+                landed_endpoints: list[str] = []
+                for d in descs:
+                    try:
+                        if d.is_memory_replica():
+                            mem_desc = d.get_memory_descriptor()
+                            landed_endpoints.append(
+                                str(mem_desc.buffer_descriptor.transport_endpoint)
+                            )
+                        else:
+                            landed_endpoints.append("<disk>")
+                    except Exception as e:
+                        landed_endpoints.append(f"<err:{e}>")
+                logger.info(
+                    "[put_diag] device=%s own=%s pref=%s landed(sample=%d)=%s "
+                    "n_keys=%d total_MB=%.1f",
+                    self.config.device_name,
+                    own_hostname,
+                    pref_seg,
+                    sample_n,
+                    landed_endpoints,
+                    len(key_strs),
+                    sum(buffer_sizes) / (1024 * 1024),
+                )
+            except Exception as e:
+                logger.warning("[put_diag] query replica desc failed: %s", e)
 
     async def _batched_put_with_metadata(
         self,
