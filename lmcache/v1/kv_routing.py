@@ -94,10 +94,9 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (no-overlap, full matrix bench — head mode):
-    # route 100% of chunks to head for the head-side full matrix.
-    # Pairs with the preceding tail run to produce the tail-vs-head
-    # comparison over the full (serial + concurrent) matrix.
-    #     all-tail swap:
-    #         return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # DEBUG (d_prefill root-cause): all-tail. Paired with the preceding
+    # head-mode debug bench, we compare sync_end_ms and d_prefill to
+    # attribute the ~127ms head-vs-tail gap at 16000 tokens to either
+    # sync-drain (pending GPU work at forward end) or real forward
+    # compute time.
+    return [], list(range(num_chunks))
