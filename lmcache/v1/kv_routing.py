@@ -94,11 +94,12 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (MC_SLICE_SIZE=1MB, no-overlap):
-    # route 100% of chunks to head to see if the bigger per-op slice
-    # size (64 KB → 1 MB, commit 1e2b0e416 in vLLM repo) materially
-    # changes the head RDMA throughput — specifically whether the
-    # per-op fixed overhead component in d_kv_mnck_out drops.
-    #     all-tail swap:
-    #         return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # EXPERIMENT (MC_SLICE_SIZE=1MB, tail, no-overlap):
+    # route 100% of chunks to tail for the MC_SLICE=1MB tail-side
+    # control. Head with 1MB was 2.8× slower at 2048 (see
+    # MC_SLICE_SIZE_实验.md); tail with 8 physical NICs MIGHT behave
+    # differently because HCA-level parallelism compensates for
+    # reduced pipeline depth per HCA.
+    #     all-head swap:
+    #         return list(range(num_chunks)), []
+    return [], list(range(num_chunks))
