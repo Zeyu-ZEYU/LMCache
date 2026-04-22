@@ -94,10 +94,10 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (no-overlap, full matrix bench — tail mode):
-    # route 100% of chunks to tail for the tail-side full matrix.
-    # Pairs with the head run (all-head swap below) to produce the
-    # tail-vs-head comparison over the full (serial + concurrent) matrix.
-    #     all-head swap:
-    #         return list(range(num_chunks)), []
-    return [], list(range(num_chunks))
+    # EXPERIMENT (no-overlap, full matrix bench — head mode):
+    # route 100% of chunks to head for the head-side full matrix.
+    # Pairs with the preceding tail run to produce the tail-vs-head
+    # comparison over the full (serial + concurrent) matrix.
+    #     all-tail swap:
+    #         return [], list(range(num_chunks))
+    return list(range(num_chunks)), []
