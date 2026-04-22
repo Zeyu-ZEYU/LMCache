@@ -797,11 +797,18 @@ class LMCacheConnectorV1Impl:
         t_prefill_end: float,
         t_kv_start: float,
         t_kv_mnck_in_end: float,
+        sync_start_ms: float = 0.0,
+        sync_end_ms: float = 0.0,
     ) -> None:
         """Append one prefill-side request record to producer JSONL.
 
         All four timestamps are wall-clock epoch seconds (time.time())
         so the benchmark can cross-join with decode-side records.
+
+        ``sync_start_ms`` / ``sync_end_ms`` are DEBUG instrumentation:
+        the wall-clock cost of ``torch.cuda.synchronize()`` at the
+        start/end of the prefill window, used to attribute any
+        head-vs-tail d_prefill gap to sync wait vs. real compute.
         """
         try:
             line = json.dumps({
@@ -811,6 +818,8 @@ class LMCacheConnectorV1Impl:
                 "t_prefill_end": t_prefill_end,
                 "t_kv_start": t_kv_start,
                 "t_kv_mnck_in_end": t_kv_mnck_in_end,
+                "sync_start_ms": sync_start_ms,
+                "sync_end_ms": sync_end_ms,
                 "ts": time.time(),
             })
             with open(self._METRICS_FILE_PRODUCER, "a") as f:
@@ -878,10 +887,21 @@ class LMCacheConnectorV1Impl:
         is_prefill_producer = self.kv_role == "kv_producer"
         is_kv_consumer = self.kv_role == "kv_consumer"
         t_prefill_start: Optional[float] = None
+        # DEBUG: instrument to split d_prefill sync-wait vs. everything else.
+        # sync_wait at start_load_kv captures how long we block for the
+        # PREVIOUS iteration's trailing GPU kernels to drain. This cost is
+        # NOT part of d_prefill (it precedes t_prefill_start) but helps
+        # identify whether head mode has more pending GPU work between
+        # iterations. sync_wait in wait_for_save (below) IS part of
+        # d_prefill — if it dominates, the head-mode gap is GPU-pending
+        # work at forward end rather than forward compute itself.
+        sync_start_ms: float = 0.0
         if is_prefill_producer:
+            t_before_sync = time.time()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_prefill_start = time.time()
+            sync_start_ms = (t_prefill_start - t_before_sync) * 1000.0
 
         # Consumer-side KV pull timing: record the instant we enter
         # start_load_kv on the decode side. This is t_kv_mnck_out_start
@@ -910,9 +930,14 @@ class LMCacheConnectorV1Impl:
         if is_prefill_producer:
             if not hasattr(self, "_prefill_start_times"):
                 self._prefill_start_times: dict[str, float] = {}
+            if not hasattr(self, "_prefill_sync_start_ms"):
+                self._prefill_sync_start_ms: dict[str, float] = {}
             for request in metadata.requests:
                 self._prefill_start_times.setdefault(
                     request.req_id, t_prefill_start
+                )
+                self._prefill_sync_start_ms.setdefault(
+                    request.req_id, sync_start_ms
                 )
 
         # Record t_kv_mnck_out_start per consumer request (setdefault so
@@ -1410,9 +1435,15 @@ class LMCacheConnectorV1Impl:
         # Same rationale as the layerwise branch above: sync to capture
         # the true GPU-end-of-forward, not host-time after the last
         # kernel was merely launched.
+        #
+        # DEBUG: measure the sync wait separately so we can tell whether
+        # d_prefill's head-vs-tail gap is sync-drain (pending GPU work at
+        # forward end) or actual compute-time difference.
+        t_before_sync_end = time.time()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t_prefill_end = time.time()
+        sync_end_ms = (t_prefill_end - t_before_sync_end) * 1000.0
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -1538,8 +1569,10 @@ class LMCacheConnectorV1Impl:
         # window.
         remote_backend = self._get_remote_backend()
         prefill_starts = getattr(self, "_prefill_start_times", {})
+        sync_start_map = getattr(self, "_prefill_sync_start_ms", {})
         for req_id in submitted_req_ids:
             t_prefill_start = prefill_starts.pop(req_id, t_prefill_end)
+            sync_start_ms = sync_start_map.pop(req_id, 0.0)
             t_kv_mnck_in_end: Optional[float] = None
             if remote_backend is not None:
                 _, t_kv_mnck_in_end = remote_backend.wait_put_done(req_id)
@@ -1551,6 +1584,8 @@ class LMCacheConnectorV1Impl:
                 t_prefill_start, t_prefill_end,
                 t_prefill_end,      # t_kv_start == t_prefill_end in non-overlap
                 t_kv_mnck_in_end,
+                sync_start_ms=sync_start_ms,
+                sync_end_ms=sync_end_ms,
             )
 
     @_lmcache_nvtx_annotate
