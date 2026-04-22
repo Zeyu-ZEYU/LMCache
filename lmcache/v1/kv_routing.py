@@ -94,7 +94,7 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (no-overlap full-matrix rerun v4 event-based — tail):
-    # paired with the head run via commit swap:
-    #     all-head swap:  return list(range(num_chunks)), []
-    return [], list(range(num_chunks))
+    # EXPERIMENT (no-overlap full-matrix rerun v4 event-based — head):
+    # paired with the tail run via commit swap:
+    #     all-tail swap:  return [], list(range(num_chunks))
+    return list(range(num_chunks)), []
