@@ -94,12 +94,10 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (MC_SLICE_SIZE=1MB, tail, no-overlap):
-    # route 100% of chunks to tail for the MC_SLICE=1MB tail-side
-    # control. Head with 1MB was 2.8× slower at 2048 (see
-    # MC_SLICE_SIZE_实验.md); tail with 8 physical NICs MIGHT behave
-    # differently because HCA-level parallelism compensates for
-    # reduced pipeline depth per HCA.
-    #     all-head swap:
-    #         return list(range(num_chunks)), []
-    return [], list(range(num_chunks))
+    # EXPERIMENT (no-overlap, full matrix bench — head mode):
+    # route 100% of chunks to head for the head-side full matrix
+    # (6 input_lens × serial + concurrent). Pairs with the preceding
+    # tail run to give tail vs head comparison across the matrix.
+    #     all-tail swap:
+    #         return [], list(range(num_chunks))
+    return list(range(num_chunks)), []
