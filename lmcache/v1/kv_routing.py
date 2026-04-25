@@ -94,8 +94,8 @@ def route_kv_chunks(
             return list(range(num_chunks)), []
         return [], list(range(num_chunks))
     """
-    # EXPERIMENT (no-overlap full-matrix v5 spec-aligned — HEAD):
-    # all KV chunks route through the management head NIC (mlx5_0).
-    # Paired with the tail run via commit swap:
-    #     all-tail swap:  return [], list(range(num_chunks))
-    return list(range(num_chunks)), []
+    # EXPERIMENT (vbench v1 — TAIL):
+    # all KV chunks route through the GPU-affine bonded tail RNICs
+    # (mlx5_bond_0..3). Paired with the head run via commit swap:
+    #     all-head swap: return list(range(num_chunks)), []
+    return [], list(range(num_chunks))
