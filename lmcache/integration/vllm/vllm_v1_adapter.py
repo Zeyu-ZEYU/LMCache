@@ -3,7 +3,9 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import json
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -439,6 +441,129 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
         self.requests.append(req_meta)
 
 
+class _PrefillTimingRecorder:
+    """Records ``d_prefill`` (prefill GPU forward duration) per request.
+
+    On the prefill (kv_producer) worker we bracket the forward pass with two
+    CUDA events:
+
+      - ``e_prefill_start`` recorded on the default stream at the *end* of
+        ``start_load_kv`` (i.e. right before the forward kernels are
+        launched). Any KV retrieve issued inside ``start_load_kv`` finishes
+        / syncs before this point, so the event captures "default stream is
+        ready to start forward".
+      - ``e_prefill_end`` recorded on the default stream at the *start* of
+        ``wait_for_save`` (i.e. right after the forward kernels have been
+        enqueued; the event will fire once the GPU drains them).
+
+    ``d_prefill = e_prefill_start.elapsed_time(e_prefill_end)`` (ms) is the
+    real GPU forward time. We avoid blocking the host: each ``wait_for_save``
+    appends ``(req_ids, e_start, e_end)`` to a queue and then flushes any
+    queue entries whose ``e_end`` has already fired (``Event.query()``).
+    Stragglers are picked up on subsequent calls or on ``shutdown``.
+
+    Output: one JSONL file per process at
+    ``$LMCACHE_D_PREFILL_DIR/d_prefill_<pid>.jsonl``. Each line:
+
+        {"req_id": "...", "d_prefill_ms": 123.45, "ts": 1714.., "pid": 12345}
+
+    Enabled only when ``LMCACHE_D_PREFILL_DIR`` is set, the role is WORKER,
+    ``kv_role == "kv_producer"``, and CUDA is available. Otherwise the
+    recorder is ``None`` and all hooks become no-ops, so non-bench runs are
+    unaffected.
+    """
+
+    def __init__(self, output_dir: str):
+        self._output_dir = output_dir
+        self._pending: list[
+            tuple[list[str], "torch.cuda.Event", "torch.cuda.Event"]
+        ] = []
+        self._last_e_start: Optional["torch.cuda.Event"] = None
+        os.makedirs(output_dir, exist_ok=True)
+        self._fd = open(
+            os.path.join(output_dir, f"d_prefill_{os.getpid()}.jsonl"),
+            "a",
+            buffering=1,  # line-buffered so tail -f / SCP mid-run is safe
+        )
+
+    def on_start_load_kv_end(self) -> None:
+        """Record ``e_prefill_start`` on the default stream."""
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        self._last_e_start = e
+
+    def on_wait_for_save_start(self, req_ids: list[str]) -> None:
+        """Record ``e_prefill_end`` and queue ``(req_ids, e_start, e_end)``.
+
+        If there is no pending ``e_start`` (first call, or ``start_load_kv``
+        was skipped) or ``req_ids`` is empty, this is a no-op.
+        """
+        if self._last_e_start is None or not req_ids:
+            return
+        e_end = torch.cuda.Event(enable_timing=True)
+        e_end.record()
+        self._pending.append((list(req_ids), self._last_e_start, e_end))
+        self._last_e_start = None
+
+    def flush_completed(self) -> None:
+        """Write JSONL lines for any queue entries whose ``e_end`` has fired.
+
+        Non-blocking: entries whose ``e_end`` is still in flight remain in
+        the queue and get retried on the next ``flush_completed`` call.
+        """
+        if not self._pending:
+            return
+        still_pending = []
+        ts = time.time()
+        for req_ids, e_start, e_end in self._pending:
+            if e_end.query():
+                d_ms = e_start.elapsed_time(e_end)
+                for req_id in req_ids:
+                    self._fd.write(
+                        json.dumps(
+                            {
+                                "req_id": req_id,
+                                "d_prefill_ms": d_ms,
+                                "ts": ts,
+                                "pid": os.getpid(),
+                            }
+                        )
+                        + "\n"
+                    )
+            else:
+                still_pending.append((req_ids, e_start, e_end))
+        self._pending = still_pending
+
+    def shutdown(self) -> None:
+        """Force-flush remaining events (synchronizes) and close the file."""
+        for req_ids, e_start, e_end in self._pending:
+            try:
+                e_end.synchronize()
+                d_ms = e_start.elapsed_time(e_end)
+            except Exception:  # noqa: BLE001 — best effort on shutdown
+                continue
+            ts = time.time()
+            for req_id in req_ids:
+                self._fd.write(
+                    json.dumps(
+                        {
+                            "req_id": req_id,
+                            "d_prefill_ms": d_ms,
+                            "ts": ts,
+                            "pid": os.getpid(),
+                        }
+                    )
+                    + "\n"
+                )
+        self._pending = []
+        if self._fd is not None:
+            try:
+                self._fd.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._fd = None
+
+
 class LMCacheConnectorV1Impl:
     def __init__(
         self,
@@ -564,6 +689,28 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+
+        # Optional d_prefill recorder (CUDA-event-based prefill GPU forward
+        # duration). Opt-in via LMCACHE_D_PREFILL_DIR env var, only on the
+        # prefill worker side. See _PrefillTimingRecorder doc for details.
+        self._prefill_recorder: Optional[_PrefillTimingRecorder] = None
+        if (
+            role == KVConnectorRole.WORKER
+            and self.kv_role == "kv_producer"
+            and os.environ.get("LMCACHE_D_PREFILL_DIR")
+            and torch.cuda.is_available()
+        ):
+            try:
+                self._prefill_recorder = _PrefillTimingRecorder(
+                    os.environ["LMCACHE_D_PREFILL_DIR"]
+                )
+                logger.info(
+                    "d_prefill recorder enabled, writing to %s",
+                    os.environ["LMCACHE_D_PREFILL_DIR"],
+                )
+            except Exception as e:  # noqa: BLE001 — never block engine init
+                logger.warning("Failed to init _PrefillTimingRecorder: %s", e)
+                self._prefill_recorder = None
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -873,6 +1020,14 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
 
+        # d_prefill: record e_prefill_start on the default stream right
+        # before the forward kernels are launched. Per spec
+        # (tasks/对齐Metrics.md), placing it at the end of start_load_kv is
+        # correct for both no-overlap and overlap modes since
+        # start_load_kv pulls all the KV in one call.
+        if self._prefill_recorder is not None:
+            self._prefill_recorder.on_start_load_kv_end()
+
     def record_failed_blocks(
         self,
         request_id: str,
@@ -1083,6 +1238,15 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
+        # d_prefill: record e_prefill_end on the default stream right after
+        # the forward kernels were enqueued, then flush any prior batches
+        # whose e_end has fired (non-blocking). Producer-side only; the
+        # recorder is None on consumer.
+        if self._prefill_recorder is not None:
+            req_ids = [r.req_id for r in connector_metadata.requests]
+            self._prefill_recorder.on_wait_for_save_start(req_ids)
+            self._prefill_recorder.flush_completed()
+
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             # But still need to unpin the kv caches according to req_id
@@ -1206,6 +1370,12 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        if self._prefill_recorder is not None:
+            try:
+                self._prefill_recorder.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("d_prefill recorder shutdown failed: %s", e)
+            self._prefill_recorder = None
         self._manager.stop_services()
 
     ###################
