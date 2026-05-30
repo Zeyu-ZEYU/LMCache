@@ -22,6 +22,20 @@ from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
 
+# No-contention simulation (paper ttft_contention figure): when this flag file
+# exists, the actual back-end RDMA put/get of KV-chunk DATA is skipped and served
+# locally, while the lookup/metadata path (is_exist) is left intact. This measures
+# TTFT with the KV traffic removed from the back-end network, against the baseline
+# where it shares the back-end with the MoE all-to-all. Toggle by creating /
+# removing the file on every node; checked per call, so no engine restart needed.
+_NO_CONTENTION_FLAG_FILE = os.environ.get(
+    "LMCACHE_NO_CONTENTION_FLAG", "/tmp/lmcache_no_contention.flag"
+)
+
+
+def _no_contention_active() -> bool:
+    return os.path.exists(_NO_CONTENTION_FLAG_FILE)
+
 
 @dataclass
 class MooncakeStoreConfig:
@@ -403,9 +417,16 @@ class MooncakestoreConnector(RemoteConnector):
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
-            bytes_read_list = await asyncio.to_thread(
-                self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
-            )
+            if _no_contention_active():
+                # No-contention sim: skip the back-end RDMA read. The buffers were
+                # allocated locally above; leave their (dummy) contents and report a
+                # full read so the layerwise pipeline proceeds with local-cache-hit
+                # timing. The is_exist lookup that decided this hit is untouched.
+                bytes_read_list = list(buffer_sizes)
+            else:
+                bytes_read_list = await asyncio.to_thread(
+                    self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+                )
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
             # Assemble the final result list
@@ -633,16 +654,23 @@ class MooncakestoreConnector(RemoteConnector):
             )
 
         try:
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.store.batch_put_from,
-                    key_strs,
-                    buffer_ptrs,
-                    buffer_sizes,
-                    replica_cfg,
-                ),
-                timeout=self.config.transfer_timeout,
-            )
+            if _no_contention_active():
+                # No-contention sim: skip the back-end RDMA write. The keys are
+                # already registered by the baseline run, so the master directory
+                # (and thus the hit-rate) is unaffected; the new-KV bytes simply
+                # never cross the back-end.
+                pass
+            else:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.store.batch_put_from,
+                        key_strs,
+                        buffer_ptrs,
+                        buffer_sizes,
+                        replica_cfg,
+                    ),
+                    timeout=self.config.transfer_timeout,
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "Timeout during batch_put_from; some decoders may redo prefill."
