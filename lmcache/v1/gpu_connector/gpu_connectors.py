@@ -1357,13 +1357,20 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.gpu_kv_format,
                         token_major=True,
                     )
+                buf_off = 0  # cursor into the contiguously-packed gpu buffer
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
                     assert memory_obj.tensor is not None
+                    n_tok = end - start
                     if self.use_gpu:
+                        # Store chunks may be non-contiguous (store_layer skips
+                        # already-present chunks); the gpu buffer is packed in
+                        # chunk order (slot_mapping_full), so index it by running
+                        # length, not by absolute token offset (start-offset would
+                        # run off the end of the packed buffer -> 0-size copy).
                         memory_obj.tensor.copy_(
-                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
+                            tmp_gpu_buffer_obj.tensor[buf_off : buf_off + n_tok],
                             non_blocking=True,
                         )
                     else:
@@ -1375,6 +1382,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             self.gpu_kv_format,
                             token_major=True,
                         )
+                    buf_off += n_tok
                     # Set metadata format
                     if self.use_mla:
                         memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
