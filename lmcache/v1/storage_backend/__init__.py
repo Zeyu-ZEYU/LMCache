@@ -247,9 +247,14 @@ def CreateStorageBackends(
         # First Party
         from lmcache.v1.storage_backend.routing_backend import build_kvlb_backend
 
-        storage_backends["RoutingBackend"] = build_kvlb_backend(
+        routing = build_kvlb_backend(
             config, metadata, loop, local_cpu_backend, dst_device
         )
+        storage_backends["RoutingBackend"] = routing
+        # Under GPU-direct, expose the shared GPU pool as an allocator backend so
+        # the storage manager allocates transferred KV in GPU memory (§4.1).
+        if getattr(routing, "gpu_allocator_backend", None) is not None:
+            storage_backends["GpuAllocatorBackend"] = routing.gpu_allocator_backend
 
     # Handle remote storage plugins (new way)
     if config.remote_storage_plugins and "RemoteBackend" not in _skip:

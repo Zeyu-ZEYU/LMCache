@@ -57,6 +57,9 @@ class RoutingBackend(StorageBackendInterface):
         self.children = children
         self.primary = children[0]
         self.plan = plan_source
+        # set by build_kvlb_backend under GPU-direct; the storage manager uses it
+        # as its allocator so transferred KV is GPU-resident (§4.1)
+        self.gpu_allocator_backend = None
 
     # --- the actual KVLB split -------------------------------------------------
 
@@ -144,6 +147,11 @@ class RoutingBackend(StorageBackendInterface):
         return self.primary.remove(key, force)
 
     def get_allocator_backend(self) -> AllocatorBackendInterface:
+        # Under GPU-direct, KV put to this backend is allocated in the shared
+        # dma-buf GPU pool, so batched_put reuses the GPU objects and the RDMA
+        # write sources straight from the prefill GPU (§4.1).
+        if self.gpu_allocator_backend is not None:
+            return self.gpu_allocator_backend
         return self.primary.get_allocator_backend()
 
     def close(self) -> None:
@@ -211,9 +219,30 @@ def build_kvlb_backend(config: LMCacheEngineConfig, metadata: LMCacheMetadata,
         # default: everything on the own NIC (equivalent to no KVLB)
         source = StaticRoutingPlanSource.all_own(len(devices))
 
-    logger.info("Shunt KVLB: %d device-bound backends %s (source=%s)",
-                len(devices), devices, type(source).__name__)
-    return RoutingBackend(children, source, dst_device)
+    routing = RoutingBackend(children, source, dst_device)
+
+    # GPU-direct (§4.1): one shared dma-buf GPU pool, registered with every NIC's
+    # Mooncake store, used as the storage manager's allocator so KV is allocated
+    # in GPU memory -- RDMA reads land in the prefill GPU and RDMA writes source
+    # from it, with no host staging.
+    if os.environ.get("SHUNT_GPU_DIRECT", "0") == "1":
+        from lmcache.v1.storage_backend.gpu_allocator_backend import (
+            GpuAllocatorBackend,
+        )
+
+        pool_bytes = int(os.environ.get("SHUNT_GPU_DIRECT_POOL_BYTES",
+                                        str(4 * 1024 ** 3)))
+        gpu_backend = GpuAllocatorBackend(pool_bytes, dst_device)
+        for child in children:
+            conn = getattr(child, "connection", None)
+            if conn is not None and hasattr(conn, "attach_gpu_pool"):
+                conn.attach_gpu_pool(gpu_backend)
+        routing.gpu_allocator_backend = gpu_backend
+
+    logger.info("Shunt KVLB: %d device-bound backends %s (source=%s, gpu_direct=%s)",
+                len(devices), devices, type(source).__name__,
+                routing.gpu_allocator_backend is not None)
+    return routing
 
 
 def _config_for_device(config: LMCacheEngineConfig, device: str) -> LMCacheEngineConfig:

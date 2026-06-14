@@ -448,33 +448,26 @@ class MooncakestoreConnector(RemoteConnector):
         logger.info("MooncakeConnector initialized successfully.")
 
     def _setup_gpu_direct(self):
-        """Register a GPU staging pool with Mooncake via dma-buf.
+        """GPU-direct is on; the routing backend injects one shared dma-buf GPU
+        pool (registered with every NIC's store) via :meth:`attach_gpu_pool`.
+        Until then KV uses the host path."""
+        self.gpu_allocator = None
 
-        Mooncake built with ``-DWITH_NVIDIA_PEERMEM=OFF -DUSE_CUDA=ON`` registers
-        GPU pointers through ``ibv_reg_dmabuf_mr``, so RDMA lands directly in GPU
-        memory. A :class:`TensorMemoryAllocator` sub-allocates the pool per chunk;
-        the LMCache GPU connector then copies GPU<->paged-cache GPU-to-GPU.
+    def attach_gpu_pool(self, gpu_backend) -> None:
+        """Use the routing backend's shared GPU pool for transfers (§4.1).
+
+        Registers the pool with this NIC's Mooncake store (dma-buf, via
+        ``ibv_reg_dmabuf_mr``) and allocates inbound receive buffers from it, so
+        the one-sided RDMA read lands straight in the prefill GPU; outbound chunks
+        already live in this pool (the storage manager allocates from it), so the
+        RDMA write sources straight from GPU.
         """
-        import os
-
-        import torch
-
-        from lmcache.v1.memory_management import TensorMemoryAllocator
-
         try:
-            dev = torch.cuda.current_device()
-            pool_bytes = int(os.environ.get("SHUNT_GPU_DIRECT_POOL_BYTES",
-                                            str(2 * 1024 ** 3)))
-            self._gpu_pool = torch.empty(pool_bytes, dtype=torch.uint8,
-                                         device=f"cuda:{dev}")
-            self.gpu_allocator = TensorMemoryAllocator(self._gpu_pool)
-            rc = self.store.register_buffer(self._gpu_pool.data_ptr(),
-                                            self._gpu_pool.numel())
-            logger.info("Shunt GPU-direct: registered %d-byte GPU pool with "
-                        "Mooncake via dma-buf (rc=%s)", pool_bytes, rc)
+            gpu_backend.register_with_store(self.store)
+            self.gpu_allocator = gpu_backend.get_memory_allocator()
+            logger.info("Shunt GPU-direct: connector attached to shared GPU pool")
         except Exception as e:
-            logger.error("Shunt GPU-direct setup failed (%s); using CPU path", e)
-            self.gpu_direct = False
+            logger.error("Shunt GPU-direct attach failed (%s); using host path", e)
             self.gpu_allocator = None
 
     def _register_cpu_buffer(self):
