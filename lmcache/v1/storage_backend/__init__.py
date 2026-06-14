@@ -232,6 +232,25 @@ def CreateStorageBackends(
         maru_backend = MaruBackend(config, metadata, loop, dst_device)
         storage_backends[str(maru_backend)] = maru_backend
 
+    # Shunt KVLB: route KV across device-bound Mooncake backends (§3.4). Replaces
+    # the single remote backend with one bound per RDMA NIC; the node planner's
+    # per-iteration plan (Alg. 3) decides which NIC carries each KV chunk.
+    if (
+        extra_config
+        and extra_config.get("shunt_kvlb_enabled")
+        and "RoutingBackend" not in _skip
+        and metadata.role != "scheduler"
+    ):
+        assert local_cpu_backend is not None, (
+            "Shunt KVLB requires the local CPU backend (max_local_cpu_size > 0)."
+        )
+        # First Party
+        from lmcache.v1.storage_backend.routing_backend import build_kvlb_backend
+
+        storage_backends["RoutingBackend"] = build_kvlb_backend(
+            config, metadata, loop, local_cpu_backend, dst_device
+        )
+
     # Handle remote storage plugins (new way)
     if config.remote_storage_plugins and "RemoteBackend" not in _skip:
         for plugin_name in config.remote_storage_plugins:
