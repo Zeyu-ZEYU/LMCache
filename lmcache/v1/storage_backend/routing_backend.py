@@ -176,9 +176,32 @@ def build_kvlb_backend(config: LMCacheEngineConfig, metadata: LMCacheMetadata,
     from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
     extra = config.extra_config or {}
-    devices: list[str] = extra.get("shunt_kvlb_devices", [])
-    if not devices:
-        raise ValueError("shunt_kvlb_devices must list the worker's NICs")
+
+    # Fig 10 no-contention variant: keep all KV in local CPU, no backend RDMA,
+    # so the backend fabric carries only the MoE A2A. Prefix KV is pre-warmed
+    # into the local pool, so reuse still hits (§2.3).
+    if extra.get("shunt_no_contention"):
+        assert local_cpu_backend is not None
+        logger.info("Shunt KVLB: no-contention mode (KV stays in local CPU)")
+        return RoutingBackend([local_cpu_backend],
+                              StaticRoutingPlanSource.all_own(1), dst_device)
+
+    devices: list[str] = list(extra.get("shunt_kvlb_devices", []))
+    if len(devices) < 2:
+        raise ValueError("shunt_kvlb_devices must list the node's NICs "
+                         "(>=1 backend + frontend last)")
+
+    # One config serves all of the node's DP ranks, so rotate the backend NICs
+    # per rank: this worker's own NIC first, the rest (nearest first) after, and
+    # the frontend (the last entry) always last. This makes child[0] the own NIC,
+    # matching the KVLB plan's own/borrowed/frontend ordering (§3.4).
+    import os
+
+    rank = int(os.environ.get("VLLM_DP_RANK",
+                              os.environ.get("SHUNT_WORKER_RANK", "0")))
+    *backends, frontend = devices
+    own = rank % len(backends)
+    devices = backends[own:] + backends[:own] + [frontend]
 
     children: List[StorageBackendInterface] = []
     for dev in devices:
