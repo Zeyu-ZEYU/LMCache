@@ -176,16 +176,6 @@ def build_kvlb_backend(config: LMCacheEngineConfig, metadata: LMCacheMetadata,
     from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
     extra = config.extra_config or {}
-
-    # Fig 10 no-contention variant: keep all KV in local CPU, no backend RDMA,
-    # so the backend fabric carries only the MoE A2A. Prefix KV is pre-warmed
-    # into the local pool, so reuse still hits (§2.3).
-    if extra.get("shunt_no_contention"):
-        assert local_cpu_backend is not None
-        logger.info("Shunt KVLB: no-contention mode (KV stays in local CPU)")
-        return RoutingBackend([local_cpu_backend],
-                              StaticRoutingPlanSource.all_own(1), dst_device)
-
     devices: list[str] = list(extra.get("shunt_kvlb_devices", []))
     if len(devices) < 2:
         raise ValueError("shunt_kvlb_devices must list the node's NICs "

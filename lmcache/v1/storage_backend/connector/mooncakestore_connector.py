@@ -435,7 +435,47 @@ class MooncakestoreConnector(RemoteConnector):
         # Register CPU buffer for zero-copy operations
         self._register_cpu_buffer()
 
+        # Shunt GPU-direct (§4.1): register GPU memory via dma-buf so inbound
+        # prefix-KV RDMA-reads straight into the prefill GPU and outbound new-KV
+        # RDMA-writes straight from it, with no host staging.
+        import os as _os
+
+        self.gpu_direct = _os.environ.get("SHUNT_GPU_DIRECT", "0") == "1"
+        self.gpu_allocator = None
+        if self.gpu_direct:
+            self._setup_gpu_direct()
+
         logger.info("MooncakeConnector initialized successfully.")
+
+    def _setup_gpu_direct(self):
+        """Register a GPU staging pool with Mooncake via dma-buf.
+
+        Mooncake built with ``-DWITH_NVIDIA_PEERMEM=OFF -DUSE_CUDA=ON`` registers
+        GPU pointers through ``ibv_reg_dmabuf_mr``, so RDMA lands directly in GPU
+        memory. A :class:`TensorMemoryAllocator` sub-allocates the pool per chunk;
+        the LMCache GPU connector then copies GPU<->paged-cache GPU-to-GPU.
+        """
+        import os
+
+        import torch
+
+        from lmcache.v1.memory_management import TensorMemoryAllocator
+
+        try:
+            dev = torch.cuda.current_device()
+            pool_bytes = int(os.environ.get("SHUNT_GPU_DIRECT_POOL_BYTES",
+                                            str(2 * 1024 ** 3)))
+            self._gpu_pool = torch.empty(pool_bytes, dtype=torch.uint8,
+                                         device=f"cuda:{dev}")
+            self.gpu_allocator = TensorMemoryAllocator(self._gpu_pool)
+            rc = self.store.register_buffer(self._gpu_pool.data_ptr(),
+                                            self._gpu_pool.numel())
+            logger.info("Shunt GPU-direct: registered %d-byte GPU pool with "
+                        "Mooncake via dma-buf (rc=%s)", pool_bytes, rc)
+        except Exception as e:
+            logger.error("Shunt GPU-direct setup failed (%s); using CPU path", e)
+            self.gpu_direct = False
+            self.gpu_allocator = None
 
     def _register_cpu_buffer(self):
         """Register CPU buffer for zero-copy operations."""
@@ -545,8 +585,13 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
+        # GPU-direct: receive buffers live in the dma-buf GPU pool, so the
+        # one-sided RDMA read lands straight in the prefill GPU (§4.1).
+        get_alloc = (self.gpu_allocator
+                     if self.gpu_direct and self.gpu_allocator is not None
+                     else self.local_cpu_backend)
         for i, _ in enumerate(keys):
-            obj = self.local_cpu_backend.allocate(
+            obj = get_alloc.allocate(
                 self.meta_shapes, self.meta_dtypes, self.meta_fmt
             )
             memory_objs.append(obj)
@@ -721,10 +766,23 @@ class MooncakestoreConnector(RemoteConnector):
         key_strs = [k.to_string() for k in keys]
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
+        staged: list = []   # GPU pool buffers to release after the RDMA
         for obj in memory_objs:
             assert obj.raw_tensor is not None
-            buffer_ptrs.append(obj.data_ptr)
-            buffer_sizes.append(obj.get_size())
+            # GPU-direct: the one-sided write must source from registered GPU
+            # memory. If the chunk is already GPU-resident (the transfer allocator
+            # is GPU), write straight from it; otherwise stage it into the dma-buf
+            # GPU pool first (this copy disappears when the allocator is GPU).
+            src = obj
+            if self.gpu_direct and self.gpu_allocator is not None:
+                t = getattr(obj, "tensor", None)
+                if t is None or not t.is_cuda:
+                    g = self._stage_to_gpu(obj)
+                    if g is not None:
+                        src = g
+                        staged.append(g)
+            buffer_ptrs.append(src.data_ptr)
+            buffer_sizes.append(src.get_size())
 
         try:
             await asyncio.wait_for(
@@ -741,6 +799,23 @@ class MooncakestoreConnector(RemoteConnector):
             logger.warning(
                 "Timeout during batch_put_from; some decoders may redo prefill."
             )
+        finally:
+            for g in staged:
+                g.ref_count_down()
+
+    def _stage_to_gpu(self, obj):
+        """Copy a chunk into the dma-buf GPU pool so it can be RDMA-written from
+        GPU. Returns a GPU MemoryObj, or None if staging is unavailable."""
+        try:
+            m = obj.metadata
+            g = self.gpu_allocator.allocate(m.shape, m.dtype, m.fmt)
+            if g is None:
+                return None
+            g.tensor.copy_(obj.tensor)
+            return g
+        except Exception as e:
+            logger.warning("GPU-direct put staging failed (%s); writing from host", e)
+            return None
 
     async def _batched_put_with_metadata(
         self,
