@@ -566,6 +566,30 @@ class LMCacheConnectorV1Impl:
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
 
+        # Shunt no-contention measurements: a decode instance can treat every
+        # prompt as already cached without fetching it (the prefill instance
+        # then keeps its KV in local memory). Outputs are not meaningful.
+        self._shunt_assume_hit = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "shunt_assume_hit", False
+            )
+        )
+        self._shunt_assumed: set[str] = set()
+
+    def shunt_kv_tokens(self, metadata) -> dict[str, int]:
+        """Shunt: inbound prefix-KV tokens each request loads in this step."""
+        out: dict[str, int] = {}
+        if metadata is None:
+            return out
+        chunk = self._lmcache_chunk_size
+        for req in metadata.requests:
+            spec = req.load_spec
+            if spec is None or not spec.can_load:
+                continue
+            start = spec.vllm_cached_tokens // chunk * chunk
+            out[req.req_id] = max(0, spec.lmcache_cached_tokens - start)
+        return out
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -1338,6 +1362,18 @@ class LMCacheConnectorV1Impl:
 
         req_id = request.request_id
 
+        if self._shunt_assume_hit and self.kv_role == "kv_consumer":
+            need = request.num_tokens - 1 - num_computed_tokens
+            if need <= 0:
+                return 0
+            self._shunt_assumed.add(req_id)
+            self.load_specs[req_id] = LoadSpec(
+                vllm_cached_tokens=num_computed_tokens,
+                lmcache_cached_tokens=request.num_tokens - 1,
+                can_load=False,
+            )
+            return need
+
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
@@ -1448,6 +1484,12 @@ class LMCacheConnectorV1Impl:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+
+        if request.request_id in self._shunt_assumed:
+            # Shunt no-contention measurements: blocks stay as allocated.
+            self._shunt_assumed.discard(request.request_id)
+            self._unfinished_requests[request.request_id] = request
+            return
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.

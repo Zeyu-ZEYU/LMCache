@@ -312,10 +312,7 @@ class StorageManager:
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
-        if "GpuAllocatorBackend" in self.storage_backends:
-            # Shunt GPU-direct: allocate transferred KV in the dma-buf GPU pool.
-            allocator_backend = self.storage_backends["GpuAllocatorBackend"]
-        elif self.enable_pd:
+        if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:

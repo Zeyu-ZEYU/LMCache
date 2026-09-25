@@ -657,13 +657,24 @@ class LMCacheEngine:
             num_tokens = end - start
             kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
-            )
+            # Shunt KVLB: allocate in the transfer pool of the port the KV plan
+            # picks for this chunk, so the RDMA write needs no extra copy.
+            memory_objs_multi_layer = None
+            routing = self.storage_manager.storage_backends.get("RoutingBackend")
+            if routing is not None:
+                memory_objs_multi_layer = routing.allocate_chunk(
+                    key, kv_shape_single_layer, kv_dtype, self.num_layers, self.fmt
+                )
+            if memory_objs_multi_layer is None:
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=self.fmt,
+                    busy_loop=self.config.get_extra_config_value(
+                        "force_store_wait", False
+                    ),
+                )
 
             if memory_objs_multi_layer is None:
                 logger.warning(
