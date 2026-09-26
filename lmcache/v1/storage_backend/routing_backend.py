@@ -34,6 +34,9 @@ import os
 import threading
 import time
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
@@ -55,6 +58,13 @@ def _router():
     except ImportError:
         return None
     return kv_router.get()
+
+
+def _nbytes(obj: MemoryObj) -> int:
+    t = getattr(obj, "tensor", None)
+    if t is not None:
+        return t.numel() * t.element_size()
+    return obj.get_size()
 
 
 def _dp_rank() -> int:
@@ -80,6 +90,7 @@ class RoutingBackend(StorageBackendInterface):
         dst_device: str = "cuda",
     ):
         super().__init__(dst_device=dst_device)
+        self._device = torch.cuda.current_device() if torch.cuda.is_available() else None
         extra = dict(config.extra_config or {})
         self.port_devices: List[str] = list(extra["shunt_kvlb_port_devices"])
         fe_device = extra.get("shunt_kvlb_frontend_device")
@@ -116,6 +127,8 @@ class RoutingBackend(StorageBackendInterface):
             self.fe_child = self._add_child(
                 config, metadata, loop, dst_device, fe_device, tc_own,
                 KVPool(host_pool, False, fe_device))
+        if self._device is not None:
+            torch.cuda.set_device(self._device)
         self.primary = self.children[0]
         self._put_child: Dict[Any, int] = {}
         self._lock = threading.Lock()
@@ -138,10 +151,15 @@ class RoutingBackend(StorageBackendInterface):
         saved = os.environ.get("MC_IB_TC")
         if tc is not None:
             os.environ["MC_IB_TC"] = str(tc)
+        # Mooncake may switch the current CUDA device while it probes the
+        # topology; keep this worker's device.
+        device = self._device
         try:
             child = RemoteBackend(cfg, metadata, loop, self.local_cpu_backend,
                                   dst_device)
         finally:
+            if device is not None:
+                torch.cuda.set_device(device)
             if tc is not None:
                 if saved is None:
                     os.environ.pop("MC_IB_TC", None)
@@ -213,7 +231,7 @@ class RoutingBackend(StorageBackendInterface):
             groups[idx][1].append(o)
         for idx, (ks, os_) in groups.items():
             t0 = time.time()
-            rec = self._io_record(OUT, idx, len(ks), sum(o.get_size() for o in os_), t0)
+            rec = self._io_record(OUT, idx, len(ks), sum(_nbytes(o) for o in os_), t0)
             pending = [len(ks)]
 
             def done(_key, rec=rec, pending=pending, cb=on_complete_callback):
@@ -242,7 +260,7 @@ class RoutingBackend(StorageBackendInterface):
         async def one(idx: int, pos: List[int]):
             got = await self.children[idx].batched_get_non_blocking(
                 lookup_id, [keys[i] for i in pos], transfer_spec)
-            nbytes = sum(o.get_size() for o in got if o is not None)
+            nbytes = sum(_nbytes(o) for o in got if o is not None)
             rec = self._io_record(IN, idx, len(pos), nbytes, t0)
             rec[3] = max(rec[3], time.time())
             return pos, got

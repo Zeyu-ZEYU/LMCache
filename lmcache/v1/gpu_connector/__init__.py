@@ -71,10 +71,11 @@ def CreateGPUConnector(
             VLLMPagedMemLayerwiseGPUConnector,
         )
 
-        local_worker_id = metadata.local_worker_id
         torch_dev, dev_name = get_vllm_torch_dev()
-        torch_dev.set_device(local_worker_id)
-        device = torch.device(f"{dev_name}:{local_worker_id}")
+        # vLLM has already bound this worker to its device. With data
+        # parallelism the TP rank (local_worker_id) is not the device index,
+        # so use the current device.
+        device = torch.device(f"{dev_name}:{torch_dev.current_device()}")
 
         if dev_name == "xpu":
             # First Party
