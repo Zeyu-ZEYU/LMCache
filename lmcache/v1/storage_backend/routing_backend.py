@@ -22,8 +22,10 @@ Configuration (``extra_config``):
 - ``shunt_gpu_direct``: backend clients use GPU pools (default ``true``).
 - ``shunt_gpu_pool_mb`` / ``shunt_host_pool_mb``: pool size per client.
 - ``shunt_kv_tc_own`` / ``shunt_kv_tc_borrow``: RDMA traffic class of KV on the
-  client of the worker's own device and on the other devices (optional; needs
-  a Mooncake build that reads ``MC_IB_TC`` per transfer engine).
+  client of the worker's own device and on the other devices (optional). This
+  needs the patched Mooncake, which reads ``MC_IB_TC`` per transfer engine and
+  gives both directions of a connection the class of the side that opened it,
+  so RDMA READ responses (inbound prefix-KV) carry the same class.
 """
 
 # Standard
